@@ -849,3 +849,420 @@ func startKubelet(k kubelet.Bootstrap, podCfg *config.PodConfig, kubeCfg *kubele
 	go k.ListenAndServePodResources()
 }
 ```
+
+### plegCh
+#### GenericPLEG
+kubelet中的pleg用于监听容器运行时的状态并且向kubelet推送容器的变化，主要是让podWorkers重新协调pod的状态，例如容器挂了需要重启。
+kubelet中的pleg分为两种，GenericPLEG和EventedPLEG。EventedPLEG需要kubelet启动时显式指定开启。
+
+```go
+type GenericPLEG struct {
+	// The container runtime.
+	runtime kubecontainer.Runtime
+	// The channel from which the subscriber listens events.
+	eventChannel chan *PodLifecycleEvent
+	// The internal cache for pod/container information.
+	podRecords podRecords
+	// Time of the last relisting.
+	relistTime atomic.Value
+	// Cache for storing the runtime states required for syncing pods.
+	cache kubecontainer.Cache
+	// For testability.
+	clock clock.Clock
+	// Pods that failed to have their status retrieved during a relist. These pods will be
+	// retried during the next relisting.
+	podsToReinspect map[types.UID]*kubecontainer.Pod
+	// Stop the Generic PLEG by closing the channel.
+	stopCh chan struct{}
+	// Locks the relisting of the Generic PLEG
+	relistLock sync.Mutex
+	// Indicates if the Generic PLEG is running or not
+	isRunning bool
+	// Locks the start/stop operation of Generic PLEG
+	runningMu sync.Mutex
+	// Indicates relisting related parameters
+	relistDuration *RelistDuration
+	// Mutex to serialize updateCache called by relist vs UpdateCache interface
+	podCacheMutex sync.Mutex
+}
+    // pkg/kubelet/kubelet.go:744
+    genericRelistDuration := &pleg.RelistDuration{
+        RelistPeriod:    genericPlegRelistPeriod,
+        RelistThreshold: genericPlegRelistThreshold,
+    }
+    // 初始化pleg
+    klet.pleg = pleg.NewGenericPLEG(klet.containerRuntime, eventChannel, genericRelistDuration, klet.podCache, clock.RealClock{})
+    // pkg/kubelet/kubelet.go:1664
+    // 启动pleg
+    kl.pleg.Start()
+```
+#### NewGenericPLEG
+```go
+// pkg/kubelet/pleg/generic.go:119
+// eventChannel := make(chan *pleg.PodLifecycleEvent, plegChannelCapacity)
+// klet.podCache = kubecontainer.NewCache()
+func NewGenericPLEG(runtime kubecontainer.Runtime, eventChannel chan *PodLifecycleEvent,
+	relistDuration *RelistDuration, cache kubecontainer.Cache,
+	clock clock.Clock) PodLifecycleEventGenerator {
+	return &GenericPLEG{
+		relistDuration: relistDuration,
+		runtime:        runtime,
+		eventChannel:   eventChannel,
+		podRecords:     make(podRecords),
+		cache:          cache,
+		clock:          clock,
+	}
+}
+```
+#### NewCache
+```go
+// 初始化cache
+// NewCache creates a pod cache.
+func NewCache() Cache {
+	return &cache{pods: map[types.UID]*data{}, subscribers: map[types.UID][]*subRecord{}}
+}
+```
+#### syncLoop
+```go
+// pkg/kubelet/kubelet.go:2336
+func (kl *Kubelet) syncLoop(ctx context.Context, updates <-chan kubetypes.PodUpdate, handler SyncHandler) {
+    ......
+    // pleg的event channel
+	plegCh := kl.pleg.Watch()
+	......
+	for {
+		if err := kl.runtimeState.runtimeErrors(); err != nil {
+			klog.ErrorS(err, "Skipping pod synchronization")
+			// exponential backoff
+			time.Sleep(duration)
+			duration = time.Duration(math.Min(float64(max), factor*float64(duration)))
+			continue
+		}
+		// reset backoff if we have a success
+		duration = base
+
+		kl.syncLoopMonitor.Store(kl.clock.Now())
+		if !kl.syncLoopIteration(ctx, updates, handler, syncTicker.C, housekeepingTicker.C, plegCh) {
+			break
+		}
+		kl.syncLoopMonitor.Store(kl.clock.Now())
+	}
+}
+```
+#### Start
+```go
+// pkg/kubelet/pleg/generic.go:140
+func (g *GenericPLEG) Start() {
+	g.runningMu.Lock()
+	defer g.runningMu.Unlock()
+	if !g.isRunning {
+		g.isRunning = true
+		g.stopCh = make(chan struct{})
+		go wait.Until(g.Relist, g.relistDuration.RelistPeriod, g.stopCh)
+	}
+}
+```
+#### Relist
+```go
+// 查询容器运行时获取pods/containers的数据，与内部维护的缓存中的数据进行对比，根据结果生成不同的事件
+// Relist queries the container runtime for list of pods/containers, compare
+// with the internal pods/containers, and generates events accordingly.
+func (g *GenericPLEG) Relist() {
+	g.relistLock.Lock()
+	defer g.relistLock.Unlock()
+
+	ctx := context.Background()
+	klog.V(5).InfoS("GenericPLEG: Relisting")
+
+    // metrics指标中记录relist耗时
+	if lastRelistTime := g.getRelistTime(); !lastRelistTime.IsZero() {
+		metrics.PLEGRelistInterval.Observe(metrics.SinceInSeconds(lastRelistTime))
+	}
+
+	timestamp := g.clock.Now()
+	defer func() {
+		metrics.PLEGRelistDuration.Observe(metrics.SinceInSeconds(timestamp))
+	}()
+
+    // 通过容器运行时获取所有pod的数据，包括sandbox容器
+	// Get all the pods.
+	podList, err := g.runtime.GetPods(ctx, true)
+	if err != nil {
+		klog.ErrorS(err, "GenericPLEG: Unable to retrieve pods")
+		return
+	}
+    // 更新时间
+	g.updateRelistTime(timestamp)
+    // 转换类型
+	pods := kubecontainer.Pods(podList)
+    // 设置metres，计算处于不同状态的容器数量
+	// update running pod and container count
+	updateRunningPodAndContainerMetrics(pods)
+    // 更新pod缓存
+	g.podRecords.setCurrent(pods)
+
+    // 比对，生成事件
+	// Compare the old and the current pods, and generate events.
+	eventsByPodID := map[types.UID][]*PodLifecycleEvent{}
+	for pid := range g.podRecords {
+		oldPod := g.podRecords.getOld(pid)
+		pod := g.podRecords.getCurrent(pid)
+        // 获取所有容器，包含普通容器和sandbox容器
+		// Get all containers in the old and the new pod.
+		allContainers := getContainersFromPods(oldPod, pod)
+		for _, container := range allContainers {
+            // 计算事件，看下面computeEvents
+			events := computeEvents(oldPod, pod, &container.ID)
+			for _, e := range events {
+                // 更新事件，即更新eventsByPodID
+				updateEvents(eventsByPodID, e)
+			}
+		}
+	}
+
+	var needsReinspection map[types.UID]*kubecontainer.Pod
+    // 缓存是否开启，如果开启，需要再次检查上次未通过的pod
+	if g.cacheEnabled() {
+		needsReinspection = make(map[types.UID]*kubecontainer.Pod)
+	}
+
+    // 如果有podID关联的事件产生，则更新缓存
+	// If there are events associated with a pod, we should update the
+	// podCache.
+	for pid, events := range eventsByPodID {
+		pod := g.podRecords.getCurrent(pid)
+		if g.cacheEnabled() {
+            // 检查并且更新缓存，如果缓存开启，且检查出现error，则将其置入needsReinspection下一个周期再检查
+			// updateCache() will inspect the pod and update the cache. If an
+			// error occurs during the inspection, we want PLEG to retry again
+			// in the next relist. To achieve this, we do not update the
+			// associated podRecord of the pod, so that the change will be
+			// detect again in the next relist.
+			// TODO: If many pods changed during the same relist period,
+			// inspecting the pod and getting the PodStatus to update the cache
+			// serially may take a while. We should be aware of this and
+			// parallelize if needed.
+			if err, updated := g.updateCache(ctx, pod, pid); err != nil {
+				// Rely on updateCache calling GetPodStatus to log the actual error.
+				klog.V(4).ErrorS(err, "PLEG: Ignoring events for pod", "pod", klog.KRef(pod.Namespace, pod.Name))
+
+				// make sure we try to reinspect the pod during the next relisting
+				needsReinspection[pid] = pod
+
+				continue
+			} else {
+                // 因为这个pod已经关联事件了，如果不删除的话这个pod将会被检查两次
+				// this pod was in the list to reinspect and we did so because it had events, so remove it
+				// from the list (we don't want the reinspection code below to inspect it a second time in
+				// this relist execution)
+				delete(g.podsToReinspect, pid)
+				if utilfeature.DefaultFeatureGate.Enabled(features.EventedPLEG) {
+					if !updated {
+						continue
+					}
+				}
+			}
+		}
+        // 更新缓存，r.old = r.current r.current = nil，老的变成新的，新的置为nil
+		// Update the internal storage and send out the events.
+		g.podRecords.update(pid)
+
+		// Map from containerId to exit code; used as a temporary cache for lookup
+		containerExitCode := make(map[string]int)
+
+		for i := range events {
+            // 跳过，该类型目前为未知状态，且没有其他组件使用
+			// Filter out events that are not reliable and no other components use yet.
+			if events[i].Type == ContainerChanged {
+				continue
+			}
+			select {
+            // 推送到plegCh，这个channel是通过上面kl.pleg.Watch()得来的
+			case g.eventChannel <- events[i]:
+			default:
+				metrics.PLEGDiscardEvents.Inc()
+				klog.ErrorS(nil, "Event channel is full, discard this relist() cycle event")
+			}
+            // 容器挂了
+			// Log exit code of containers when they finished in a particular event
+			if events[i].Type == ContainerDied {
+                // 没有退出码
+				// Fill up containerExitCode map for ContainerDied event when first time appeared
+				if len(containerExitCode) == 0 && pod != nil && g.cache != nil {
+                    // 获取缓存中已更新的pod状态，补充退出码
+					// Get updated podStatus
+					status, err := g.cache.Get(pod.ID)
+					if err == nil {
+						for _, containerStatus := range status.ContainerStatuses {
+							containerExitCode[containerStatus.ID.ID] = containerStatus.ExitCode
+						}
+					}
+				}
+                // 如果有退出码，记录容器ID，容器ID对应的退出码
+				if containerID, ok := events[i].Data.(string); ok {
+					if exitCode, ok := containerExitCode[containerID]; ok && pod != nil {
+						klog.V(2).InfoS("Generic (PLEG): container finished", "podID", pod.ID, "containerID", containerID, "exitCode", exitCode)
+					}
+				}
+			}
+		}
+	}
+    // 如果开启了缓存
+	if g.cacheEnabled() {
+        // 存在需要重新检验的pod
+		// reinspect any pods that failed inspection during the previous relist
+		if len(g.podsToReinspect) > 0 {
+			klog.V(5).InfoS("GenericPLEG: Reinspecting pods that previously failed inspection")
+			for pid, pod := range g.podsToReinspect {
+                // 更新缓存
+				if err, _ := g.updateCache(ctx, pod, pid); err != nil {
+					// Rely on updateCache calling GetPodStatus to log the actual error.
+					klog.V(5).ErrorS(err, "PLEG: pod failed reinspection", "pod", klog.KRef(pod.Namespace, pod.Name))
+					needsReinspection[pid] = pod
+				}
+			}
+		}
+        // 更新缓存时间
+		// Update the cache timestamp.  This needs to happen *after*
+		// all pods have been properly updated in the cache.
+		g.cache.UpdateTime(timestamp)
+	}
+    // 赋值
+	// make sure we retain the list of pods that need reinspecting the next time relist is called
+	g.podsToReinspect = needsReinspection
+}
+```
+
+#### computeEvents 
+```go
+func computeEvents(oldPod, newPod *kubecontainer.Pod, cid *kubecontainer.ContainerID) []*PodLifecycleEvent {
+	var pid types.UID
+	if oldPod != nil {
+		pid = oldPod.ID
+	} else if newPod != nil {
+		pid = newPod.ID
+	}
+	oldState := getContainerState(oldPod, cid)
+	newState := getContainerState(newPod, cid)
+	return generateEvents(pid, cid.ID, oldState, newState)
+}
+
+func getContainerState(pod *kubecontainer.Pod, cid *kubecontainer.ContainerID) plegContainerState {
+	// Default to the non-existent state.
+	state := plegContainerNonExistent
+	if pod == nil {
+		return state
+	}
+    // 寻找pod中对应的容器id
+	c := pod.FindContainerByID(*cid)
+	if c != nil {
+		return convertState(c.State)
+	}
+	// Search through sandboxes too.
+	c = pod.FindSandboxByID(*cid)
+	if c != nil {
+		return convertState(c.State)
+	}
+
+	return state
+}
+// 容器状态转换为pleg状态
+// created-> unknown running -> running exited -> exited unknown -> unknown
+func convertState(state kubecontainer.State) plegContainerState {
+	switch state {
+	case kubecontainer.ContainerStateCreated:
+		// kubelet doesn't use the "created" state yet, hence convert it to "unknown".
+		return plegContainerUnknown
+	case kubecontainer.ContainerStateRunning:
+		return plegContainerRunning
+	case kubecontainer.ContainerStateExited:
+		return plegContainerExited
+	case kubecontainer.ContainerStateUnknown:
+		return plegContainerUnknown
+	default:
+		panic(fmt.Sprintf("unrecognized container state: %v", state))
+	}
+}
+// 生成事件
+func generateEvents(podID types.UID, cid string, oldState, newState plegContainerState) []*PodLifecycleEvent {
+	if newState == oldState {
+		return nil
+	}
+
+	klog.V(4).InfoS("GenericPLEG", "podUID", podID, "containerID", cid, "oldState", oldState, "newState", newState)
+	switch newState {
+	case plegContainerRunning:
+		return []*PodLifecycleEvent{{ID: podID, Type: ContainerStarted, Data: cid}}
+	case plegContainerExited:
+		return []*PodLifecycleEvent{{ID: podID, Type: ContainerDied, Data: cid}}
+	case plegContainerUnknown:
+		return []*PodLifecycleEvent{{ID: podID, Type: ContainerChanged, Data: cid}}
+	case plegContainerNonExistent:
+		switch oldState {
+		case plegContainerExited:
+			// We already reported that the container died before.
+			return []*PodLifecycleEvent{{ID: podID, Type: ContainerRemoved, Data: cid}}
+		default:
+			return []*PodLifecycleEvent{{ID: podID, Type: ContainerDied, Data: cid}, {ID: podID, Type: ContainerRemoved, Data: cid}}
+		}
+	default:
+		panic(fmt.Sprintf("unrecognized container state: %v", newState))
+	}
+}
+```
+
+
+```go
+	case e := <-plegCh:
+        // 如果事件类型不是ContainerRemoved
+		if isSyncPodWorthy(e) {
+            // 从podManager中获取pod详情
+			// PLEG event for a pod; sync it.
+			if pod, ok := kl.podManager.GetPodByUID(e.ID); ok {
+				klog.V(2).InfoS("SyncLoop (PLEG): event for pod", "pod", klog.KObj(pod), "event", e)
+				handler.HandlePodSyncs([]*v1.Pod{pod})
+			} else {
+				// If the pod no longer exists, ignore the event.
+				klog.V(4).InfoS("SyncLoop (PLEG): pod does not exist, ignore irrelevant event", "event", e)
+			}
+		}
+        // 如果事件类型是ContainerDied
+		if e.Type == pleg.ContainerDied {
+			if containerID, ok := e.Data.(string); ok {
+                // 清除pod相关的容器
+				kl.cleanUpContainersInPod(e.ID, containerID)
+			}
+		}
+```
+
+#### HandlePodSyncs
+```go
+func (kl *Kubelet) HandlePodSyncs(pods []*v1.Pod) {
+	start := kl.clock.Now()
+	for _, pod := range pods {
+        // 从podManager的缓存中获取pod相关信息
+		pod, mirrorPod, wasMirror := kl.podManager.GetPodAndMirrorPod(pod)
+		if wasMirror {
+			if pod == nil {
+				klog.V(2).InfoS("Unable to find pod for mirror pod, skipping", "mirrorPod", klog.KObj(mirrorPod), "mirrorPodUID", mirrorPod.UID)
+				continue
+			}
+			// Syncing a mirror pod is a programmer error since the intent of sync is to
+			// batch notify all pending work. We should make it impossible to double sync,
+			// but for now log a programmer error to prevent accidental introduction.
+			klog.V(3).InfoS("Programmer error, HandlePodSyncs does not expect to receive mirror pods", "podUID", pod.UID, "mirrorPodUID", mirrorPod.UID)
+			continue
+		}
+        // 生成事件
+		kl.podWorkers.UpdatePod(UpdatePodOptions{
+			Pod:        pod,
+			MirrorPod:  mirrorPod,
+			UpdateType: kubetypes.SyncPodSync,
+			StartTime:  start,
+		})
+	}
+}
+```
+
+#### 总结
+plegCh数据的来源是kubelet从容器运行时中获取的pod和container列表，并自身维护了一个缓存，固定间隔时间获取新的数据，并与缓存中的数据进行比较，根据比对结果生成事件推送到plegCh中。podWorkers从plegCh中读取数据进行处理。
