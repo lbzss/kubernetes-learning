@@ -1266,3 +1266,553 @@ func (kl *Kubelet) HandlePodSyncs(pods []*v1.Pod) {
 
 #### 总结
 plegCh数据的来源是kubelet从容器运行时中获取的pod和container列表，并自身维护了一个缓存，固定间隔时间获取新的数据，并与缓存中的数据进行比较，根据比对结果生成事件推送到plegCh中。podWorkers从plegCh中读取数据进行处理。
+
+### syncCh
+```go
+// syncCh每隔一秒读一次
+func (kl *Kubelet) syncLoopIteration(ctx context.Context, configCh <-chan kubetypes.PodUpdate, handler SyncHandler,
+	syncCh <-chan time.Time, housekeepingCh <-chan time.Time, plegCh <-chan *pleg.PodLifecycleEvent) bool {
+    ......
+    case <-syncCh:
+		// Sync pods waiting for sync
+        // 看下面getPodsToSync
+		podsToSync := kl.getPodsToSync()
+		if len(podsToSync) == 0 {
+			break
+		}
+		klog.V(4).InfoS("SyncLoop (SYNC) pods", "total", len(podsToSync), "pods", klog.KObjSlice(podsToSync))
+        // 调用podWorkers执行更新操作
+		handler.HandlePodSyncs(podsToSync)
+    ......
+}
+```
+#### getPodsToSync
+```go
+// Get pods which should be resynchronized. Currently, the following pod should be resynchronized:
+//   - pod whose work is ready.
+//   - internal modules that request sync of a pod.
+//
+// This method does not return orphaned pods (those known only to the pod worker that may have
+// been deleted from configuration). Those pods are synced by HandlePodCleanups as a consequence
+// of driving the state machine to completion.
+//
+// TODO: Consider synchronizing all pods which have not recently been acted on to be resilient
+// to bugs that might prevent updates from being delivered (such as the previous bug with
+// orphaned pods). Instead of asking the work queue for pending work, consider asking the
+// PodWorker which pods should be synced.
+func (kl *Kubelet) getPodsToSync() []*v1.Pod {
+    // 从podManager中获取所有pod缓存信息
+	allPods := kl.podManager.GetPods()
+    // workQueue是一个用于触发podWorker的队列，实际实现中包含了时钟、锁和一个键为podID值为时间的map
+    // 看下面workQueue，这里获取时间早于现在的队列中的内容
+	podUIDs := kl.workQueue.GetWork()
+	podUIDSet := sets.NewString()
+    // 转为set
+	for _, podUID := range podUIDs {
+		podUIDSet.Insert(string(podUID))
+	}
+	var podsToSync []*v1.Pod
+	for _, pod := range allPods {
+        // 遍历所有的pod，如果podID存在于从workQueue中获取的podUID，则说明这个pod需要同步
+		if podUIDSet.Has(string(pod.UID)) {
+			// The work of the pod is ready
+			podsToSync = append(podsToSync, pod)
+			continue
+		}
+        // 如果不存在，检查pod是否能通过podSyncLoopHandler校验，如果可以则这个pod需要同步
+		for _, podSyncLoopHandler := range kl.PodSyncLoopHandlers {
+            // 看下面ShouldSync
+			if podSyncLoopHandler.ShouldSync(pod) {
+				podsToSync = append(podsToSync, pod)
+				break
+			}
+		}
+	}
+	return podsToSync
+}
+```
+#### workQueue
+workQueue中的数据来源：syncLoopIteration方法中处理来自不同channel中的事件，进入不同的handler，交给podWorkers.UpdatePod函数处理，最终进去podWorkerLoop调用podWorkers.CompleteWork。
+```go
+type basicWorkQueue struct {
+	clock clock.Clock
+	lock  sync.Mutex
+	queue map[types.UID]time.Time
+}
+
+// pkg/kubelet/pod_workers.go:1484
+// 在出现错误或者在下一个同步周期时重新排队，然后执行要处理的工作
+// completeWork requeues on error or the next sync interval and then immediately executes any pending
+// work.
+func (p *podWorkers) completeWork(podUID types.UID, phaseTransition bool, syncErr error) {
+	// Requeue the last update if the last sync returned error.
+	switch {
+    // 阶段转换
+	case phaseTransition:
+		p.workQueue.Enqueue(podUID, 0)
+    // 同步没错误
+	case syncErr == nil:
+		// No error; requeue at the regular resync interval.
+		p.workQueue.Enqueue(podUID, wait.Jitter(p.resyncInterval, workerResyncIntervalJitterFactor))
+    // 网络未就绪错误
+	case strings.Contains(syncErr.Error(), NetworkNotReadyErrorMsg):
+		// Network is not ready; back off for short period of time and retry as network might be ready soon.
+		p.workQueue.Enqueue(podUID, wait.Jitter(backOffOnTransientErrorPeriod, workerBackOffPeriodJitterFactor))
+	default:
+		// Error occurred during the sync; back off and then retry.
+		p.workQueue.Enqueue(podUID, wait.Jitter(p.backOffPeriod, workerBackOffPeriodJitterFactor))
+	}
+
+	// if there is a pending update for this worker, requeue immediately, otherwise
+	// clear working status
+	p.podLock.Lock()
+	defer p.podLock.Unlock()
+	if status, ok := p.podSyncStatuses[podUID]; ok {
+        // 如果有挂起的更新，立即重新排队
+		if status.pendingUpdate != nil {
+			select {
+			case p.podUpdates[podUID] <- struct{}{}:
+				klog.V(4).InfoS("Requeueing pod due to pending update", "podUID", podUID)
+			default:
+				klog.V(4).InfoS("Pending update already queued", "podUID", podUID)
+			}
+		} else {
+			status.working = false
+		}
+	}
+}
+
+// 就是更新时间
+// pkg/kubelet/util/queue/work_queue.go:64
+func (q *basicWorkQueue) Enqueue(item types.UID, delay time.Duration) {
+	q.lock.Lock()
+	defer q.lock.Unlock()
+	q.queue[item] = q.clock.Now().Add(delay)
+}
+
+```
+#### ShouldSync
+```go
+// ShouldSync returns true if the pod is past its active deadline.
+func (m *activeDeadlineHandler) ShouldSync(pod *v1.Pod) bool {
+	return m.pastActiveDeadline(pod)
+}
+
+// pkg/kubelet/active_deadline.go:79
+// 检查pod是否超过了活动期限
+// pastActiveDeadline returns true if the pod has been active for more than its ActiveDeadlineSeconds
+func (m *activeDeadlineHandler) pastActiveDeadline(pod *v1.Pod) bool {
+    // 用于限制pod的运行时间，常用于job类型的pod
+	// no active deadline was specified
+	if pod.Spec.ActiveDeadlineSeconds == nil {
+		return false
+	}
+	// get the latest status to determine if it was started
+	podStatus, ok := m.podStatusProvider.GetPodStatus(pod.UID)
+	if !ok {
+        // 使用传入的Pod的当前状态作为获取的最新pod状态
+		podStatus = pod.Status
+	}
+	// we have no start time so just return
+	if podStatus.StartTime.IsZero() {
+		return false
+	}
+	// determine if the deadline was exceeded
+	start := podStatus.StartTime.Time
+	duration := m.clock.Since(start)
+	allowedDuration := time.Duration(*pod.Spec.ActiveDeadlineSeconds) * time.Second
+	return duration >= allowedDuration
+}
+```
+#### 总结
+syncCh会定期读取缓存中所有的pod信息和队列中的pod信息，遍历所有pod信息，校验是否需要同步，最终还是交给podWorkers完成Update操作
+
+### housekeepingCh
+```go
+	case <-housekeepingCh:
+        // 检查上面configCh中初始化的三种config来源，本地文件，http，listwatch资源是否准备好，确保必须的pod信息源都已经同步
+		if !kl.sourcesReady.AllReady() {
+			// If the sources aren't ready or volume manager has not yet synced the states,
+			// skip housekeeping, as we may accidentally delete pods from unready sources.
+			klog.V(4).InfoS("SyncLoop (housekeeping, skipped): sources aren't ready yet")
+		} else {
+			start := time.Now()
+			klog.V(4).InfoS("SyncLoop (housekeeping)")
+            // 看下面HandlePodCleanups
+			if err := handler.HandlePodCleanups(ctx); err != nil {
+				klog.ErrorS(err, "Failed cleaning pods")
+			}
+            // 如果清理时间过长记录错误
+			duration := time.Since(start)
+			if duration > housekeepingWarningDuration {
+				klog.ErrorS(fmt.Errorf("housekeeping took too long"), "Housekeeping took longer than expected", "expected", housekeepingWarningDuration, "actual", duration.Round(time.Millisecond))
+			}
+			klog.V(4).InfoS("SyncLoop (housekeeping) end", "duration", duration.Round(time.Millisecond))
+		}
+	}
+```
+#### HandlePodCleanups
+```go
+// pkg/kubelet/kubelet_pods.go:1101
+// 清理工作包含终止pod workers，杀掉不需要的pod，移除孤儿容器、卷目录等
+// HandlePodCleanups performs a series of cleanup work, including terminating
+// pod workers, killing unwanted pods, and removing orphaned volumes/pod
+// directories. No config changes are sent to pod workers while this method
+// is executing which means no new pods can appear. After this method completes
+// the desired state of the kubelet should be reconciled with the actual state
+// in the pod worker and other pod-related components.
+//
+// This function is executed by the main sync loop, so it must execute quickly
+// and all nested calls should be asynchronous. Any slow reconciliation actions
+// should be performed by other components (like the volume manager). The duration
+// of this call is the minimum latency for static pods to be restarted if they
+// are updated with a fixed UID (most should use a dynamic UID), and no config
+// updates are delivered to the pod workers while this method is running.
+func (kl *Kubelet) HandlePodCleanups(ctx context.Context) error {
+	// The kubelet lacks checkpointing, so we need to introspect the set of pods
+	// in the cgroup tree prior to inspecting the set of pods in our pod manager.
+	// this ensures our view of the cgroup tree does not mistakenly observe pods
+	// that are added after the fact...
+	var (
+		cgroupPods map[types.UID]cm.CgroupName
+		err        error
+	)
+	if kl.cgroupsPerQOS {
+		pcm := kl.containerManager.NewPodContainerManager()
+        // 查看pod用到的cgroup
+		cgroupPods, err = pcm.GetAllPodsFromCgroups()
+		if err != nil {
+			return fmt.Errorf("failed to get list of pods that still exist on cgroup mounts: %v", err)
+		}
+	}
+    // 从podManager中获取pod和mirrorPod
+	allPods, mirrorPods, orphanedMirrorPodFullnames := kl.podManager.GetPodsAndMirrorPods()
+
+	// Pod phase progresses monotonically. Once a pod has reached a final state,
+	// it should never leave regardless of the restart policy. The statuses
+	// of such pods should not be changed, and there is no need to sync them.
+	// TODO: the logic here does not handle two cases:
+	//   1. If the containers were removed immediately after they died, kubelet
+	//      may fail to generate correct statuses, let alone filtering correctly.
+	//   2. If kubelet restarted before writing the terminated status for a pod
+	//      to the apiserver, it could still restart the terminated pod (even
+	//      though the pod was not considered terminated by the apiserver).
+	// These two conditions could be alleviated by checkpointing kubelet.
+
+	// Stop the workers for terminated pods not in the config source
+	klog.V(3).InfoS("Clean up pod workers for terminated pods")
+    // 从podWorkers中获取所有有状态的pod，看下面SyncKnownPods
+	workingPods := kl.podWorkers.SyncKnownPods(allPods)
+
+	// Reconcile: At this point the pod workers have been pruned to the set of
+	// desired pods. Pods that must be restarted due to UID reuse, or leftover
+	// pods from previous runs, are not known to the pod worker.
+
+	allPodsByUID := make(map[types.UID]*v1.Pod)
+	for _, pod := range allPods {
+		allPodsByUID[pod.UID] = pod
+	}
+
+	// Identify the set of pods that have workers, which should be all pods
+	// from config that are not terminated, as well as any terminating pods
+	// that have already been removed from config. Pods that are terminating
+	// will be added to possiblyRunningPods, to prevent overly aggressive
+	// cleanup of pod cgroups.
+	stringIfTrue := func(t bool) string {
+		if t {
+			return "true"
+		}
+		return ""
+	}
+	runningPods := make(map[types.UID]sets.Empty)
+	possiblyRunningPods := make(map[types.UID]sets.Empty)
+	for uid, sync := range workingPods {
+		switch sync.State {
+		case SyncPod:
+			runningPods[uid] = struct{}{}
+			possiblyRunningPods[uid] = struct{}{}
+		case TerminatingPod:
+			possiblyRunningPods[uid] = struct{}{}
+		default:
+		}
+	}
+
+    // 更新缓存，记录时间戳
+	// Retrieve the list of running containers from the runtime to perform cleanup.
+	// We need the latest state to avoid delaying restarts of static pods that reuse
+	// a UID.
+	if err := kl.runtimeCache.ForceUpdateIfOlder(ctx, kl.clock.Now()); err != nil {
+		klog.ErrorS(err, "Error listing containers")
+		return err
+	}
+    // 从缓存中获取pod
+	runningRuntimePods, err := kl.runtimeCache.GetPods(ctx)
+	if err != nil {
+		klog.ErrorS(err, "Error listing containers")
+		return err
+	}
+
+	// Stop probing pods that are not running
+	klog.V(3).InfoS("Clean up probes for terminated pods")
+    // 如果探针不存在于possiblyRunningPods，则停止探针
+	kl.probeManager.CleanupPods(possiblyRunningPods)
+
+	// Remove orphaned pod statuses not in the total list of known config pods
+	klog.V(3).InfoS("Clean up orphaned pod statuses")
+    // statusManager中删除不存在于pod清单中的状态缓存，管理器中存在，allPod列表不存在
+	kl.removeOrphanedPodStatuses(allPods, mirrorPods)
+
+    // 清理只有孤儿pod的命名空间分配
+	// Remove orphaned pod user namespace allocations (if any).
+	klog.V(3).InfoS("Clean up orphaned pod user namespace allocations")
+	if err = kl.usernsManager.CleanupOrphanedPodUsernsAllocations(allPods, runningRuntimePods); err != nil {
+		klog.ErrorS(err, "Failed cleaning up orphaned pod user namespaces allocations")
+	}
+
+    // 清理孤儿pod的挂载卷占用
+	// Remove orphaned volumes from pods that are known not to have any
+	// containers. Note that we pass all pods (including terminated pods) to
+	// the function, so that we don't remove volumes associated with terminated
+	// but not yet deleted pods.
+	// TODO: this method could more aggressively cleanup terminated pods
+	// in the future (volumes, mount dirs, logs, and containers could all be
+	// better separated)
+	klog.V(3).InfoS("Clean up orphaned pod directories")
+	err = kl.cleanupOrphanedPodDirs(allPods, runningRuntimePods)
+	if err != nil {
+		// We want all cleanup tasks to be run even if one of them failed. So
+		// we just log an error here and continue other cleanup tasks.
+		// This also applies to the other clean up tasks.
+		klog.ErrorS(err, "Failed cleaning up orphaned pod directories")
+	}
+
+    // 删除镜像Pod
+	// Remove any orphaned mirror pods (mirror pods are tracked by name via the
+	// pod worker)
+	klog.V(3).InfoS("Clean up orphaned mirror pods")
+	for _, podFullname := range orphanedMirrorPodFullnames {
+		if !kl.podWorkers.IsPodForMirrorPodTerminatingByFullName(podFullname) {
+			_, err := kl.mirrorPodClient.DeleteMirrorPod(podFullname, nil)
+			if err != nil {
+				klog.ErrorS(err, "Encountered error when deleting mirror pod", "podName", podFullname)
+			} else {
+				klog.V(3).InfoS("Deleted mirror pod", "podName", podFullname)
+			}
+		}
+	}
+
+	// After pruning pod workers for terminated pods get the list of active pods for
+	// metrics and to determine restarts.
+	activePods := kl.filterOutInactivePods(allPods)
+	allRegularPods, allStaticPods := splitPodsByStatic(allPods)
+	activeRegularPods, activeStaticPods := splitPodsByStatic(activePods)
+	metrics.DesiredPodCount.WithLabelValues("").Set(float64(len(allRegularPods)))
+	metrics.DesiredPodCount.WithLabelValues("true").Set(float64(len(allStaticPods)))
+	metrics.ActivePodCount.WithLabelValues("").Set(float64(len(activeRegularPods)))
+	metrics.ActivePodCount.WithLabelValues("true").Set(float64(len(activeStaticPods)))
+	metrics.MirrorPodCount.Set(float64(len(mirrorPods)))
+
+	// At this point, the pod worker is aware of which pods are not desired (SyncKnownPods).
+	// We now look through the set of active pods for those that the pod worker is not aware of
+	// and deliver an update. The most common reason a pod is not known is because the pod was
+	// deleted and recreated with the same UID while the pod worker was driving its lifecycle (very
+	// very rare for API pods, common for static pods with fixed UIDs). Containers that may still
+	// be running from a previous execution must be reconciled by the pod worker's sync method.
+	// We must use active pods because that is the set of admitted pods (podManager includes pods
+	// that will never be run, and statusManager tracks already rejected pods).
+	var restartCount, restartCountStatic int
+	for _, desiredPod := range activePods {
+        // 如果期望的pod不存在于podWorkers中，则重新推给podWorkers执行重启操作
+		if _, knownPod := workingPods[desiredPod.UID]; knownPod {
+			continue
+		}
+
+		klog.V(3).InfoS("Pod will be restarted because it is in the desired set and not known to the pod workers (likely due to UID reuse)", "podUID", desiredPod.UID)
+		isStatic := kubetypes.IsStaticPod(desiredPod)
+		pod, mirrorPod, wasMirror := kl.podManager.GetPodAndMirrorPod(desiredPod)
+		if pod == nil || wasMirror {
+			klog.V(2).InfoS("Programmer error, restartable pod was a mirror pod but activePods should never contain a mirror pod", "podUID", desiredPod.UID)
+			continue
+		}
+		kl.podWorkers.UpdatePod(UpdatePodOptions{
+			UpdateType: kubetypes.SyncPodCreate,
+			Pod:        pod,
+			MirrorPod:  mirrorPod,
+		})
+        // 更新缓存
+		// the desired pod is now known as well
+		workingPods[desiredPod.UID] = PodWorkerSync{State: SyncPod, HasConfig: true, Static: isStatic}
+		if isStatic {
+			// restartable static pods are the normal case
+			restartCountStatic++
+		} else {
+			// almost certainly means shenanigans, as API pods should never have the same UID after being deleted and recreated
+			// unless there is a major API violation
+			restartCount++
+		}
+	}
+	metrics.RestartedPodTotal.WithLabelValues("true").Add(float64(restartCountStatic))
+	metrics.RestartedPodTotal.WithLabelValues("").Add(float64(restartCount))
+
+    // 过滤出那些没有DeletionTimestamp，不在terminal阶段，且不在podWorkers中的pod，然后去掉那些在容器运行时缓存中状态为running的pod，剩下的pod需要被kill掉，同样，推送给podWorkers去做
+	// Complete termination of deleted pods that are not runtime pods (don't have
+	// running containers), are terminal, and are not known to pod workers.
+	// An example is pods rejected during kubelet admission that have never
+	// started before (i.e. does not have an orphaned pod).
+	// Adding the pods with SyncPodKill to pod workers allows to proceed with
+	// force-deletion of such pods, yet preventing re-entry of the routine in the
+	// next invocation of HandlePodCleanups.
+	for _, pod := range kl.filterTerminalPodsToDelete(allPods, runningRuntimePods, workingPods) {
+		klog.V(3).InfoS("Handling termination and deletion of the pod to pod workers", "pod", klog.KObj(pod), "podUID", pod.UID)
+		kl.podWorkers.UpdatePod(UpdatePodOptions{
+			UpdateType: kubetypes.SyncPodKill,
+			Pod:        pod,
+		})
+	}
+
+    // 终止那些容器运行时缓存中存在，但不在podWorkers缓存中的pod
+	// Finally, terminate any pods that are observed in the runtime but not present in the list of
+	// known running pods from config. If we do terminate running runtime pods that will happen
+	// asynchronously in the background and those will be processed in the next invocation of
+	// HandlePodCleanups.
+	var orphanCount int
+	for _, runningPod := range runningRuntimePods {
+		// If there are orphaned pod resources in CRI that are unknown to the pod worker, terminate them
+		// now. Since housekeeping is exclusive to other pod worker updates, we know that no pods have
+		// been added to the pod worker in the meantime. Note that pods that are not visible in the runtime
+		// but which were previously known are terminated by SyncKnownPods().
+		_, knownPod := workingPods[runningPod.ID]
+		if !knownPod {
+			one := int64(1)
+			killPodOptions := &KillPodOptions{
+				PodTerminationGracePeriodSecondsOverride: &one,
+			}
+			klog.V(2).InfoS("Clean up containers for orphaned pod we had not seen before", "podUID", runningPod.ID, "killPodOptions", killPodOptions)
+			kl.podWorkers.UpdatePod(UpdatePodOptions{
+				UpdateType:     kubetypes.SyncPodKill,
+				RunningPod:     runningPod,
+				KillPodOptions: killPodOptions,
+			})
+
+            // 写入workingPods缓存
+			// the running pod is now known as well
+			workingPods[runningPod.ID] = PodWorkerSync{State: TerminatingPod, Orphan: true}
+			orphanCount++
+		}
+	}
+	metrics.OrphanedRuntimePodTotal.Add(float64(orphanCount))
+
+	// Now that we have recorded any terminating pods, and added new pods that should be running,
+	// record a summary here. Not all possible combinations of PodWorkerSync values are valid.
+	counts := make(map[PodWorkerSync]int)
+	for _, sync := range workingPods {
+		counts[sync]++
+	}
+	for validSync, configState := range map[PodWorkerSync]string{
+		{HasConfig: true, Static: true}:                "desired",
+		{HasConfig: true, Static: false}:               "desired",
+		{Orphan: true, HasConfig: true, Static: true}:  "orphan",
+		{Orphan: true, HasConfig: true, Static: false}: "orphan",
+		{Orphan: true, HasConfig: false}:               "runtime_only",
+	} {
+		for _, state := range []PodWorkerState{SyncPod, TerminatingPod, TerminatedPod} {
+			validSync.State = state
+			count := counts[validSync]
+			delete(counts, validSync)
+			staticString := stringIfTrue(validSync.Static)
+			if !validSync.HasConfig {
+				staticString = "unknown"
+			}
+			metrics.WorkingPodCount.WithLabelValues(state.String(), configState, staticString).Set(float64(count))
+		}
+	}
+	if len(counts) > 0 {
+		// in case a combination is lost
+		klog.V(3).InfoS("Programmer error, did not report a kubelet_working_pods metric for a value returned by SyncKnownPods", "counts", counts)
+	}
+
+    // 如果开启了cgroup，清理cgroups
+	// Remove any cgroups in the hierarchy for pods that are definitely no longer
+	// running (not in the container runtime).
+	if kl.cgroupsPerQOS {
+		pcm := kl.containerManager.NewPodContainerManager()
+		klog.V(3).InfoS("Clean up orphaned pod cgroups")
+		kl.cleanupOrphanedPodCgroups(pcm, cgroupPods, possiblyRunningPods)
+	}
+
+	// Cleanup any backoff entries.
+	kl.backOff.GC()
+	return nil
+}
+```
+
+#### SyncKnownPods
+```go
+// SyncKnownPods will purge any fully terminated pods that are not in the desiredPods
+// list, which means SyncKnownPods must be called in a threadsafe manner from calls
+// to UpdatePods for new pods. Because the podworker is dependent on UpdatePod being
+// invoked to drive a pod's state machine, if a pod is missing in the desired list the
+// pod worker must be responsible for delivering that update. The method returns a map
+// of known workers that are not finished with a value of SyncPodTerminated,
+// SyncPodKill, or SyncPodSync depending on whether the pod is terminated, terminating,
+// or syncing.
+func (p *podWorkers) SyncKnownPods(desiredPods []*v1.Pod) map[types.UID]PodWorkerSync {
+	workers := make(map[types.UID]PodWorkerSync)
+	known := make(map[types.UID]struct{})
+	for _, pod := range desiredPods {
+		known[pod.UID] = struct{}{}
+	}
+
+	p.podLock.Lock()
+	defer p.podLock.Unlock()
+
+	p.podsSynced = true
+    // podSyncStatuses来源于pkg/kubelet/pod_workers.go：798
+	for uid, status := range p.podSyncStatuses {
+		// We retain the worker history of any pod that is still desired according to
+		// its UID. However, there are two scenarios during a sync that result in us
+		// needing to purge the history:
+		//
+		// 1. The pod is no longer desired (the local version is orphaned)
+		// 2. The pod received a kill update and then a subsequent create, which means
+		//    the UID was reused in the source config (vanishingly rare for API servers,
+		//    common for static pods that have specified a fixed UID)
+		//
+		// In the former case we wish to bound the amount of information we store for
+		// deleted pods. In the latter case we wish to minimize the amount of time before
+		// we restart the static pod. If we succeed at removing the worker, then we
+		// omit it from the returned map of known workers, and the caller of SyncKnownPods
+		// is expected to send a new UpdatePod({UpdateType: Create}).
+		_, knownPod := known[uid]
+        // 是否是孤儿pod
+		orphan := !knownPod
+        // 如果pod需要被重启或者是个孤儿pod
+		if status.restartRequested || orphan {
+            // 删除pod的工作状态
+			if p.removeTerminatedWorker(uid, status, orphan) {
+				// no worker running, we won't return it
+				continue
+			}
+		}
+        // 重新赋值
+		sync := PodWorkerSync{
+			State:  status.WorkType(),
+			Orphan: orphan,
+		}
+		switch {
+		case status.activeUpdate != nil:
+			if status.activeUpdate.Pod != nil {
+				sync.HasConfig = true
+				sync.Static = kubetypes.IsStaticPod(status.activeUpdate.Pod)
+			}
+		case status.pendingUpdate != nil:
+			if status.pendingUpdate.Pod != nil {
+				sync.HasConfig = true
+				sync.Static = kubetypes.IsStaticPod(status.pendingUpdate.Pod)
+			}
+		}
+		workers[uid] = sync
+	}
+	return workers
+}
+```
