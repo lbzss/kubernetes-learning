@@ -433,6 +433,7 @@ func (p *podWorkers) UpdatePod(options UpdatePodOptions) {
 func (p *podWorkers) podWorkerLoop(podUID types.UID, podUpdates <-chan struct{}) {
     var lastSyncTime time.Time
     for range podUpdates {
+      // 看podWorkers.md startPodSync
        ctx, update, canStart, canEverStart, ok := p.startPodSync(podUID)
        // If we had no update waiting, it means someone initialized the channel without filling out pendingUpdate.
        if !ok {
@@ -481,17 +482,23 @@ func (p *podWorkers) podWorkerLoop(podUID types.UID, podUpdates <-chan struct{})
           // Take the appropriate action (illegal phases are prevented by UpdatePod)
           switch {
           case update.WorkType == TerminatedPod:
+            // 看下面SyncTerminatedPod
              err = p.podSyncer.SyncTerminatedPod(ctx, update.Options.Pod, status)
+             // 检查更新类型
           case update.WorkType == TerminatingPod:
+            // 获取优雅终止的宽限期
              var gracePeriod *int64
              if opt := update.Options.KillPodOptions; opt != nil {
                 gracePeriod = opt.PodTerminationGracePeriodSecondsOverride
              }
+             // 返回更新pod状态的函数，返回最后一个函数，如果有pod终止请求但是还没有开始处理，标记为已开始处理
              podStatusFn := p.acknowledgeTerminating(podUID)
              // if we only have a running pod, terminate it directly
              if update.Options.RunningPod != nil {
+               // 看下文SyncTerminatingPod，孤儿pod
                 err = p.podSyncer.SyncTerminatingRuntimePod(ctx, update.Options.RunningPod)
              } else {
+               // 看下文SyncTerminatingPod，如果这里返回了错误则会进入下面的错误处理阶段
                 err = p.podSyncer.SyncTerminatingPod(ctx, update.Options.Pod, status, gracePeriod, podStatusFn)
              }
           default:
@@ -501,14 +508,58 @@ func (p *podWorkers) podWorkerLoop(podUID types.UID, podUpdates <-chan struct{})
           lastSyncTime = p.clock.Now()
           return err
        }()
-       ...
-       // queue a retry if necessary, then put the next event in the channel if any
-       p.completeWork(podUID, phaseTransition, err)
-       if start := update.Options.StartTime; !start.IsZero() {
-          metrics.PodWorkerDuration.WithLabelValues(update.Options.UpdateType.String()).Observe(metrics.SinceInSeconds(start))
-       }
-       klog.V(4).InfoS("Processing pod event done", "pod", podRef, "podUID", podUID, "updateType", update.WorkType)
-    }
+
+      // 阶段转换标记
+		var phaseTransition bool
+		switch {
+      // 手动取消
+		case err == context.Canceled:
+			// when the context is cancelled we expect an update to already be queued
+			klog.V(2).InfoS("Sync exited with context cancellation error", "pod", podRef, "podUID", podUID, "updateType", update.WorkType)
+      // 会重试
+		case err != nil:
+			// we will queue a retry
+			klog.ErrorS(err, "Error syncing pod, skipping", "pod", podRef, "podUID", podUID)
+      // TerminatedPod
+		case update.WorkType == TerminatedPod:
+         // 看下面completeTerminated
+			// we can shut down the worker
+			p.completeTerminated(podUID)
+			if start := update.Options.StartTime; !start.IsZero() {
+				metrics.PodWorkerDuration.WithLabelValues("terminated").Observe(metrics.SinceInSeconds(start))
+			}
+			klog.V(4).InfoS("Processing pod event done", "pod", podRef, "podUID", podUID, "updateType", update.WorkType)
+			return
+      // TerminatingPod
+		case update.WorkType == TerminatingPod:
+			// pods that don't exist in config don't need to be terminated, other loops will clean them up
+			if update.Options.RunningPod != nil {
+            // 看下面completeTerminatingRuntimePod
+				p.completeTerminatingRuntimePod(podUID)
+				if start := update.Options.StartTime; !start.IsZero() {
+					metrics.PodWorkerDuration.WithLabelValues(update.Options.UpdateType.String()).Observe(metrics.SinceInSeconds(start))
+				}
+				klog.V(4).InfoS("Processing pod event done", "pod", podRef, "podUID", podUID, "updateType", update.WorkType)
+				return
+			}
+			// otherwise we move to the terminating phase
+			p.completeTerminating(podUID)
+			phaseTransition = true
+
+		case isTerminal:
+			// if syncPod indicated we are now terminal, set the appropriate pod status to move to terminating
+			klog.V(4).InfoS("Pod is terminal", "pod", podRef, "podUID", podUID, "updateType", update.WorkType)
+			p.completeSync(podUID)
+			phaseTransition = true
+		}
+
+		// queue a retry if necessary, then put the next event in the channel if any
+		p.completeWork(podUID, phaseTransition, err)
+		if start := update.Options.StartTime; !start.IsZero() {
+			metrics.PodWorkerDuration.WithLabelValues(update.Options.UpdateType.String()).Observe(metrics.SinceInSeconds(start))
+		}
+		klog.V(4).InfoS("Processing pod event done", "pod", podRef, "podUID", podUID, "updateType", update.WorkType)
+	}
 }
 ```
 #### Kubelet.SyncPod
@@ -1633,5 +1684,432 @@ func (m *kubeGenericRuntimeManager) startContainer(ctx context.Context, podSandb
 	}
 
 	return "", nil
+}
+```
+
+#### SyncTerminatedPod
+```go
+// pkg/kubelet/kubelet.go:2146
+// 清理已经终止（没有运行中的容器）的pod。期望关闭或删除所有的pod资源，当这个方法退出时，对应的pod应该已经做好被清理的准备
+// 因为kubelet没有持久化存储信息，所有的这个方法的操作比如修改落盘状态文件的操作等都必须重载并且被HandlePodCleanups或单独的循环中进行垃圾回收处理。
+// 这通常发生在你强制删除pod，不管是从本地磁盘配置文件或者通过api，同时kubelet重启的情况下。
+// SyncTerminatedPod cleans up a pod that has terminated (has no running containers).
+// The invocations in this call are expected to tear down all pod resources.
+// When this method exits the pod is expected to be ready for cleanup. This method
+// reduces the latency of pod cleanup but is not guaranteed to get called in all scenarios.
+//
+// Because the kubelet has no local store of information, all actions in this method that modify
+// on-disk state must be reentrant and be garbage collected by HandlePodCleanups or a separate loop.
+// This typically occurs when a pod is force deleted from configuration (local disk or API) and the
+// kubelet restarts in the middle of the action.
+func (kl *Kubelet) SyncTerminatedPod(ctx context.Context, pod *v1.Pod, podStatus *kubecontainer.PodStatus) error {
+	ctx, otelSpan := kl.tracer.Start(ctx, "syncTerminatedPod", trace.WithAttributes(
+		semconv.K8SPodUIDKey.String(string(pod.UID)),
+		attribute.String("k8s.pod", klog.KObj(pod).String()),
+		semconv.K8SPodNameKey.String(pod.Name),
+		semconv.K8SNamespaceNameKey.String(pod.Namespace),
+	))
+	defer otelSpan.End()
+	klog.V(4).InfoS("SyncTerminatedPod enter", "pod", klog.KObj(pod), "podUID", pod.UID)
+	defer klog.V(4).InfoS("SyncTerminatedPod exit", "pod", klog.KObj(pod), "podUID", pod.UID)
+
+   // 生成Podstatus结构体
+	// generate the final status of the pod
+	// TODO: should we simply fold this into TerminatePod? that would give a single pod update
+	apiPodStatus := kl.generateAPIPodStatus(pod, podStatus, true)
+
+   // 更新statusManager的状态，并且触发syncBatch将状态推给apiserver
+	kl.statusManager.SetPodStatus(pod, apiPodStatus)
+
+   // 等待csi卷卸载
+	// volumes are unmounted after the pod worker reports ShouldPodRuntimeBeRemoved (which is satisfied
+	// before syncTerminatedPod is invoked)
+	if err := kl.volumeManager.WaitForUnmount(ctx, pod); err != nil {
+		return err
+	}
+	klog.V(4).InfoS("Pod termination unmounted volumes", "pod", klog.KObj(pod), "podUID", pod.UID)
+
+	if !kl.keepTerminatedPodVolumes {
+      // 等待卷卸载完毕
+		// This waiting loop relies on the background cleanup which starts after pod workers respond
+		// true for ShouldPodRuntimeBeRemoved, which happens after `SyncTerminatingPod` is completed.
+		if err := wait.PollUntilContextCancel(ctx, 100*time.Millisecond, true, func(ctx context.Context) (bool, error) {
+			volumesExist := kl.podVolumesExist(pod.UID)
+			if volumesExist {
+				klog.V(3).InfoS("Pod is terminated, but some volumes have not been cleaned up", "pod", klog.KObj(pod), "podUID", pod.UID)
+			}
+			return !volumesExist, nil
+		}); err != nil {
+			return err
+		}
+		klog.V(3).InfoS("Pod termination cleaned up volume paths", "pod", klog.KObj(pod), "podUID", pod.UID)
+	}
+
+   // 在secretMananger中注销该pod
+	// After volume unmount is complete, let the secret and configmap managers know we're done with this pod
+	if kl.secretManager != nil {
+		kl.secretManager.UnregisterPod(pod)
+	}
+   // 在configMapManager中注销该pod
+	if kl.configMapManager != nil {
+		kl.configMapManager.UnregisterPod(pod)
+	}
+
+	// Note: we leave pod containers to be reclaimed in the background since dockershim requires the
+	// container for retrieving logs and we want to make sure logs are available until the pod is
+	// physically deleted.
+
+	// remove any cgroups in the hierarchy for pods that are no longer running.
+	if kl.cgroupsPerQOS {
+		pcm := kl.containerManager.NewPodContainerManager()
+		name, _ := pcm.GetPodContainerName(pod)
+      // 销毁pod对应的podContainerManager
+		if err := pcm.Destroy(name); err != nil {
+			return err
+		}
+		klog.V(4).InfoS("Pod termination removed cgroups", "pod", klog.KObj(pod), "podUID", pod.UID)
+	}
+
+   // 
+	kl.usernsManager.Release(pod.UID)
+
+   // statusManager中标记pod为终止状态，最终也会回传给apiserver更新
+	// mark the final pod status
+	kl.statusManager.TerminatePod(pod)
+	klog.V(4).InfoS("Pod is terminated and will need no more status updates", "pod", klog.KObj(pod), "podUID", pod.UID)
+
+	return nil
+}
+```
+
+#### SyncTerminatingRuntimePod
+```go
+// pkg/kubelet/kubelet.go:2115
+// 该方法期望终止孤儿pod中所有的运行中的容器。一旦这个方法没有错误的退出，任何保存在本地的相关状态可以被其他子系统地后台进程安全地清除。
+// 不同于syncTerminatingPod方法，因为缺少完整的pod声明清单相关信息所以无法执行生命周期相关操作
+// 仅保证运行中的pod被终止并且允许垃圾回收运行。同样，我们不会在缓存中更新pod状态，因为配置源已经被删掉了，我们没有地方去传递状态变更信息。
+// SyncTerminatingRuntimePod is expected to terminate running containers in a pod that we have no
+// configuration for. Once this method returns without error, any remaining local state can be safely
+// cleaned up by background processes in each subsystem. Unlike syncTerminatingPod, we lack
+// knowledge of the full pod spec and so cannot perform lifecycle related operations, only ensure
+// that the remnant of the running pod is terminated and allow garbage collection to proceed. We do
+// not update the status of the pod because with the source of configuration removed, we have no
+// place to send that status.
+func (kl *Kubelet) SyncTerminatingRuntimePod(_ context.Context, runningPod *kubecontainer.Pod) error {
+	// TODO(#113606): connect this with the incoming context parameter, which comes from the pod worker.
+	// Currently, using that context causes test failures.
+	ctx := context.Background()
+   // 生成对应结构体
+	pod := runningPod.ToAPIPod()
+	klog.V(4).InfoS("SyncTerminatingRuntimePod enter", "pod", klog.KObj(pod), "podUID", pod.UID)
+	defer klog.V(4).InfoS("SyncTerminatingRuntimePod exit", "pod", klog.KObj(pod), "podUID", pod.UID)
+
+	// we kill the pod directly since we have lost all other information about the pod.
+	klog.V(4).InfoS("Orphaned running pod terminating without grace period", "pod", klog.KObj(pod), "podUID", pod.UID)
+	// TODO: this should probably be zero, to bypass any waiting (needs fixes in container runtime)
+	gracePeriod := int64(1)
+   // killpod，调用containerManager直接killpod，同时更新Cgroup配置
+	if err := kl.killPod(ctx, pod, *runningPod, &gracePeriod); err != nil {
+		kl.recorder.Eventf(pod, v1.EventTypeWarning, events.FailedToKillPod, "error killing pod: %v", err)
+		// there was an error killing the pod, so we return that error directly
+		utilruntime.HandleError(err)
+		return err
+	}
+	klog.V(4).InfoS("Pod termination stopped all running orphaned containers", "pod", klog.KObj(pod), "podUID", pod.UID)
+	return nil
+}
+```
+#### SyncTerminatingPod
+```go
+// SyncTerminatingPod is expected to terminate all running containers in a pod. Once this method
+// returns without error, the pod is considered to be terminated and it will be safe to clean up any
+// pod state that is tied to the lifetime of running containers. The next method invoked will be
+// SyncTerminatedPod. This method is expected to return with the grace period provided and the
+// provided context may be cancelled if the duration is exceeded. The method may also be interrupted
+// with a context cancellation if the grace period is shortened by the user or the kubelet (such as
+// during eviction). This method is not guaranteed to be called if a pod is force deleted from the
+// configuration and the kubelet is restarted - SyncTerminatingRuntimePod handles those orphaned
+// pods.
+func (kl *Kubelet) SyncTerminatingPod(_ context.Context, pod *v1.Pod, podStatus *kubecontainer.PodStatus, gracePeriod *int64, podStatusFn func(*v1.PodStatus)) error {
+	// TODO(#113606): connect this with the incoming context parameter, which comes from the pod worker.
+	// Currently, using that context causes test failures.
+	ctx, otelSpan := kl.tracer.Start(context.Background(), "syncTerminatingPod", trace.WithAttributes(
+		semconv.K8SPodUIDKey.String(string(pod.UID)),
+		attribute.String("k8s.pod", klog.KObj(pod).String()),
+		semconv.K8SPodNameKey.String(pod.Name),
+		semconv.K8SNamespaceNameKey.String(pod.Namespace),
+	))
+	defer otelSpan.End()
+	klog.V(4).InfoS("SyncTerminatingPod enter", "pod", klog.KObj(pod), "podUID", pod.UID)
+	defer klog.V(4).InfoS("SyncTerminatingPod exit", "pod", klog.KObj(pod), "podUID", pod.UID)
+
+	apiPodStatus := kl.generateAPIPodStatus(pod, podStatus, false)
+	if podStatusFn != nil {
+		podStatusFn(&apiPodStatus)
+	}
+   // statusManager中更新pod状态
+	kl.statusManager.SetPodStatus(pod, apiPodStatus)
+
+	if gracePeriod != nil {
+		klog.V(4).InfoS("Pod terminating with grace period", "pod", klog.KObj(pod), "podUID", pod.UID, "gracePeriod", *gracePeriod)
+	} else {
+		klog.V(4).InfoS("Pod terminating with grace period", "pod", klog.KObj(pod), "podUID", pod.UID, "gracePeriod", nil)
+	}
+
+   // 停止pod相关的启动探针和存活探针检测，最后调用的时worker.stop()
+	kl.probeManager.StopLivenessAndStartup(pod)
+
+   // 类型转换
+	p := kubecontainer.ConvertPodStatusToRunningPod(kl.getRuntime().Type(), podStatus)
+   // killPod
+	if err := kl.killPod(ctx, pod, p, gracePeriod); err != nil {
+		kl.recorder.Eventf(pod, v1.EventTypeWarning, events.FailedToKillPod, "error killing pod: %v", err)
+		// there was an error killing the pod, so we return that error directly
+		utilruntime.HandleError(err)
+		return err
+	}
+   // 停止其他的探针检测
+	// Once the containers are stopped, we can stop probing for liveness and readiness.
+	// TODO: once a pod is terminal, certain probes (liveness exec) could be stopped immediately after
+	//   the detection of a container shutdown or (for readiness) after the first failure. Tracked as
+	//   https://github.com/kubernetes/kubernetes/issues/107894 although may not be worth optimizing.
+	kl.probeManager.RemovePod(pod)
+
+   // 调用容器运行时获取Pod状态
+	// Guard against consistency issues in KillPod implementations by checking that there are no
+	// running containers. This method is invoked infrequently so this is effectively free and can
+	// catch race conditions introduced by callers updating pod status out of order.
+	// TODO: have KillPod return the terminal status of stopped containers and write that into the
+	//  cache immediately
+	podStatus, err := kl.containerRuntime.GetPodStatus(ctx, pod.UID, pod.Name, pod.Namespace)
+	if err != nil {
+		klog.ErrorS(err, "Unable to read pod status prior to final pod termination", "pod", klog.KObj(pod), "podUID", pod.UID)
+		return err
+	}
+	var runningContainers []string
+	type container struct {
+		Name       string
+		State      string
+		ExitCode   int
+		FinishedAt string
+	}
+	var containers []container
+	klogV := klog.V(4)
+	klogVEnabled := klogV.Enabled()
+	for _, s := range podStatus.ContainerStatuses {
+		if s.State == kubecontainer.ContainerStateRunning {
+			runningContainers = append(runningContainers, s.ID.String())
+		}
+		if klogVEnabled {
+			containers = append(containers, container{Name: s.Name, State: string(s.State), ExitCode: s.ExitCode, FinishedAt: s.FinishedAt.UTC().Format(time.RFC3339Nano)})
+		}
+	}
+	if klogVEnabled {
+		sort.Slice(containers, func(i, j int) bool { return containers[i].Name < containers[j].Name })
+		klog.V(4).InfoS("Post-termination container state", "pod", klog.KObj(pod), "podUID", pod.UID, "containers", containers)
+	}
+   // 检查运行中容器数量，如果仍然有运行中的容器，稍后再试
+	if len(runningContainers) > 0 {
+		return fmt.Errorf("detected running containers after a successful KillPod, CRI violation: %v", runningContainers)
+	}
+
+	// NOTE: resources must be unprepared AFTER all containers have stopped
+	// and BEFORE the pod status is changed on the API server
+	// to avoid race conditions with the resource deallocation code in kubernetes core.
+	if utilfeature.DefaultFeatureGate.Enabled(features.DynamicResourceAllocation) {
+		if err := kl.UnprepareDynamicResources(pod); err != nil {
+			return err
+		}
+	}
+
+	// Compute and update the status in cache once the pods are no longer running.
+	// The computation is done here to ensure the pod status used for it contains
+	// information about the container end states (including exit codes) - when
+	// SyncTerminatedPod is called the containers may already be removed.
+	apiPodStatus = kl.generateAPIPodStatus(pod, podStatus, true)
+	kl.statusManager.SetPodStatus(pod, apiPodStatus)
+
+	// we have successfully stopped all containers, the pod is terminating, our status is "done"
+	klog.V(4).InfoS("Pod termination stopped all running containers", "pod", klog.KObj(pod), "podUID", pod.UID)
+
+	return nil
+}
+```
+#### completeTerminated
+```go
+// 该方法在syncTerminatedPod方法调用后再调用，属于killpod的最后一步，停止podWorker
+// completeTerminated is invoked after syncTerminatedPod completes successfully and means we
+// can stop the pod worker. The pod is finalized at this point.
+func (p *podWorkers) completeTerminated(podUID types.UID) {
+	p.podLock.Lock()
+	defer p.podLock.Unlock()
+
+	klog.V(4).InfoS("Pod is complete and the worker can now stop", "podUID", podUID)
+
+   // 关闭update channel
+	p.cleanupPodUpdates(podUID)
+
+	status, ok := p.podSyncStatuses[podUID]
+	if !ok {
+		return
+	}
+	if status.terminatingAt.IsZero() {
+		klog.V(4).InfoS("Pod worker is complete but did not have terminatingAt set, likely programmer error", "podUID", podUID)
+	}
+	if status.terminatedAt.IsZero() {
+		klog.V(4).InfoS("Pod worker is complete but did not have terminatedAt set, likely programmer error", "podUID", podUID)
+	}
+	status.finished = true
+	status.working = false
+
+   // 删除缓存
+	if p.startedStaticPodsByFullname[status.fullname] == podUID {
+		delete(p.startedStaticPodsByFullname, status.fullname)
+	}
+}
+```
+#### completeTerminatingRuntimePod
+```go
+// 用于清理孤儿pod，因为没有其他的配置，因此直接关闭podUpdate channel并且删除缓存，停止追踪状态
+// completeTerminatingRuntimePod is invoked when syncTerminatingPod completes successfully,
+// which means an orphaned pod (no config) is terminated and we can exit. Since orphaned
+// pods have no API representation, we want to exit the loop at this point and ensure no
+// status is present afterwards - the running pod is truly terminated when this is invoked.
+func (p *podWorkers) completeTerminatingRuntimePod(podUID types.UID) {
+	p.podLock.Lock()
+	defer p.podLock.Unlock()
+
+	klog.V(4).InfoS("Pod terminated all orphaned containers successfully and worker can now stop", "podUID", podUID)
+
+	p.cleanupPodUpdates(podUID)
+
+	status, ok := p.podSyncStatuses[podUID]
+	if !ok {
+		return
+	}
+	if status.terminatingAt.IsZero() {
+		klog.V(4).InfoS("Pod worker was terminated but did not have terminatingAt set, likely programmer error", "podUID", podUID)
+	}
+	status.terminatedAt = p.clock.Now()
+	status.finished = true
+	status.working = false
+
+	if p.startedStaticPodsByFullname[status.fullname] == podUID {
+		delete(p.startedStaticPodsByFullname, status.fullname)
+	}
+
+	// A runtime pod is transient and not part of the desired state - once it has reached
+	// terminated we can abandon tracking it.
+	delete(p.podSyncStatuses, podUID)
+}
+```
+#### completeTerminating
+```go
+// 当syncTerminatingPod成功完成后调用该方法，此时没有运行中的容器，且未来不会有容器被启动，已经准备好进行清理工作
+// 关闭状态提示channel不再接收后续的事件更新
+// completeTerminating is invoked when syncTerminatingPod completes successfully, which means
+// no container is running, no container will be started in the future, and we are ready for
+// cleanup.  This updates the termination state which prevents future syncs and will ensure
+// other kubelet loops know this pod is not running any containers.
+func (p *podWorkers) completeTerminating(podUID types.UID) {
+	p.podLock.Lock()
+	defer p.podLock.Unlock()
+
+	klog.V(4).InfoS("Pod terminated all containers successfully", "podUID", podUID)
+
+	status, ok := p.podSyncStatuses[podUID]
+	if !ok {
+		return
+	}
+
+	// update the status of the pod
+	if status.terminatingAt.IsZero() {
+		klog.V(4).InfoS("Pod worker was terminated but did not have terminatingAt set, likely programmer error", "podUID", podUID)
+	}
+	status.terminatedAt = p.clock.Now()
+	for _, ch := range status.notifyPostTerminating {
+		close(ch)
+	}
+	status.notifyPostTerminating = nil
+	status.statusPostTerminating = nil
+
+   // 直接触发重新调度，更新状态
+	// the pod has now transitioned to terminated and we want to run syncTerminatedPod
+	// as soon as possible, so if no update is already waiting queue a synthetic update
+	p.requeueLastPodUpdate(podUID, status)
+}
+```
+#### completeSync
+```go
+// syncPod成功退出后调用该方法，表示这个pod现在是中止状态并且应该被终止。这个情况发生在pod声明周期结束时，即没有RestartAlways的pod退出的时候。
+// 其他的状态，比如kubelet驱逐、API驱动的删除和状态转换依然由UpdatePod来管理
+// completeSync is invoked when syncPod completes successfully and indicates the pod is now terminal and should
+// be terminated. This happens when the natural pod lifecycle completes - any pod which is not RestartAlways
+// exits. Unnatural completions, such as evictions, API driven deletion or phase transition, are handled by
+// UpdatePod.
+func (p *podWorkers) completeSync(podUID types.UID) {
+	p.podLock.Lock()
+	defer p.podLock.Unlock()
+
+	klog.V(4).InfoS("Pod indicated lifecycle completed naturally and should now terminate", "podUID", podUID)
+
+	status, ok := p.podSyncStatuses[podUID]
+	if !ok {
+		klog.V(4).InfoS("Pod had no status in completeSync, programmer error?", "podUID", podUID)
+		return
+	}
+
+	// update the status of the pod
+	if status.terminatingAt.IsZero() {
+		status.terminatingAt = p.clock.Now()
+	} else {
+		klog.V(4).InfoS("Pod worker attempted to set terminatingAt twice, likely programmer error", "podUID", podUID)
+	}
+	status.startedTerminating = true
+
+   // 立刻重新调度
+	// the pod has now transitioned to terminating and we want to run syncTerminatingPod
+	// as soon as possible, so if no update is already waiting queue a synthetic update
+	p.requeueLastPodUpdate(podUID, status)
+}
+```
+#### completeWork
+```go
+// 重新调度之前出错的worker或者在下一个同步周期重新调度，如果pod处于阶段转换状态，则立马重新调度，否则会加一个随机延时以防止击穿
+// completeWork requeues on error or the next sync interval and then immediately executes any pending
+// work.
+func (p *podWorkers) completeWork(podUID types.UID, phaseTransition bool, syncErr error) {
+	// Requeue the last update if the last sync returned error.
+	switch {
+	case phaseTransition:
+		p.workQueue.Enqueue(podUID, 0)
+	case syncErr == nil:
+		// No error; requeue at the regular resync interval.
+		p.workQueue.Enqueue(podUID, wait.Jitter(p.resyncInterval, workerResyncIntervalJitterFactor))
+	case strings.Contains(syncErr.Error(), NetworkNotReadyErrorMsg):
+		// Network is not ready; back off for short period of time and retry as network might be ready soon.
+		p.workQueue.Enqueue(podUID, wait.Jitter(backOffOnTransientErrorPeriod, workerBackOffPeriodJitterFactor))
+	default:
+		// Error occurred during the sync; back off and then retry.
+		p.workQueue.Enqueue(podUID, wait.Jitter(p.backOffPeriod, workerBackOffPeriodJitterFactor))
+	}
+
+	// if there is a pending update for this worker, requeue immediately, otherwise
+	// clear working status
+	p.podLock.Lock()
+	defer p.podLock.Unlock()
+   // 如果podUID对应的worker有PendingUpdate，则立马重新调度，否则，清除工作状态
+	if status, ok := p.podSyncStatuses[podUID]; ok {
+		if status.pendingUpdate != nil {
+			select {
+			case p.podUpdates[podUID] <- struct{}{}:
+				klog.V(4).InfoS("Requeueing pod due to pending update", "podUID", podUID)
+			default:
+				klog.V(4).InfoS("Pending update already queued", "podUID", podUID)
+			}
+		} else {
+			status.working = false
+		}
+	}
 }
 ```
