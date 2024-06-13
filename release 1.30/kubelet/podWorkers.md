@@ -648,13 +648,14 @@ func (p *podWorkers) startPodSync(podUID types.UID) (ctx context.Context, update
 }
 ```
 #### completeSync
+看kubelet.md
 
 #### completeTerminating
-
+看kubelet.md
 #### completeTerminatingRuntimePod
-
+看kubelet.md
 #### completeTerminated
-
+看kubelet.md
 #### podWorkerLoop
 看kubelet.md
 

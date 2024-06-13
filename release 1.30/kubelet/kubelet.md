@@ -1,3 +1,6 @@
+## Kubelet流程图
+![kubelet流程图](statics/kubelet.png)
+
 ## 启动流程
 
 cmd/kubelet/kubelet.go -> cmd/kubelet/app/server.go -> pkg/kubelet/kubelet.go
