@@ -531,6 +531,7 @@ func (runner *runner) Monitor(canary Chain, tables []Table, reloadFunc func(), i
 // Return an error when updated
 func (o *Options) runLoop() error {
 	if o.watcher != nil {
+        // 看下面watcher.Run
 		o.watcher.Run()
 	}
 
@@ -548,3 +549,367 @@ func (o *Options) runLoop() error {
 	}
 }
 ```
+#### watcher.Run
+```go
+func (w *fsnotifyWatcher) Run() {
+	go func() {
+		defer w.watcher.Close()
+		for {
+			select {
+            // 如果文件发生变化则会有事件发送到event channel，如增删改查权限变更等
+			case event := <-w.watcher.Events:
+				if w.eventHandler != nil {
+                    // eventHandler在initWatcher时传入，eventHandler处理write或rename类型的事件，生成信息发送到errCh
+					w.eventHandler(event)
+				}
+			case err := <-w.watcher.Errors:
+				if w.errorHandler != nil {
+                    // 如果有错误事件也发送到errCh
+					w.errorHandler(err)
+				}
+			}
+		}
+	}()
+}
+```
+#### ProxyServer.Run
+```go
+// cmd/kube-proxy/app/server.go:870
+// Run runs the specified ProxyServer.  This should never exit (unless CleanupAndExit is set).
+// TODO: At the moment, Run() cannot return a nil error, otherwise it's caller will never exit. Update callers of Run to handle nil errors.
+func (s *ProxyServer) Run() error {
+	// To help debugging, immediately log version
+	s.logger.Info("Version info", "version", version.Get())
+
+	s.logger.Info("Golang settings", "GOGC", os.Getenv("GOGC"), "GOMAXPROCS", os.Getenv("GOMAXPROCS"), "GOTRACEBACK", os.Getenv("GOTRACEBACK"))
+
+    // OOM配置，如果没有指定oom评分则默认设置为-999，尽量减少因OOM导致的进程被kill的风险
+	// TODO(vmarmol): Use container config for this.
+	var oomAdjuster *oom.OOMAdjuster
+	if s.Config.OOMScoreAdj != nil {
+		oomAdjuster = oom.NewOOMAdjuster()
+		if err := oomAdjuster.ApplyOOMScoreAdj(0, int(*s.Config.OOMScoreAdj)); err != nil {
+			s.logger.V(2).Info("Failed to apply OOMScore", "err", err)
+		}
+	}
+
+	if s.Broadcaster != nil {
+		stopCh := make(chan struct{})
+		s.Broadcaster.StartRecordingToSink(stopCh)
+	}
+
+	// TODO(thockin): make it possible for healthz and metrics to be on the same port.
+
+	var healthzErrCh, metricsErrCh chan error
+	if s.Config.BindAddressHardFail {
+		healthzErrCh = make(chan error)
+		metricsErrCh = make(chan error)
+	}
+
+    // 启动muxhandler，用于探活和健康状态检测
+	// Start up a healthz server if requested
+	serveHealthz(s.logger, s.HealthzServer, healthzErrCh)
+
+	// Start up a metrics server if requested
+	serveMetrics(s.Config.MetricsBindAddress, s.Config.Mode, s.Config.EnableProfiling, metricsErrCh)
+
+    // labelselector
+	noProxyName, err := labels.NewRequirement(apis.LabelServiceProxyName, selection.DoesNotExist, nil)
+	if err != nil {
+		return err
+	}
+
+	noHeadlessEndpoints, err := labels.NewRequirement(v1.IsHeadlessService, selection.DoesNotExist, nil)
+	if err != nil {
+		return err
+	}
+
+	labelSelector := labels.NewSelector()
+	labelSelector = labelSelector.Add(*noProxyName, *noHeadlessEndpoints)
+
+    // 创建informer
+	// Make informers that filter out objects that want a non-default service proxy.
+	informerFactory := informers.NewSharedInformerFactoryWithOptions(s.Client, s.Config.ConfigSyncPeriod.Duration,
+		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.LabelSelector = labelSelector.String()
+		}))
+
+    // 监听service和endpoint注册事件，当发生变化时，刷新iptables规则
+	// Create configs (i.e. Watches for Services, EndpointSlices and ServiceCIDRs)
+	// Note: RegisterHandler() calls need to happen before creation of Sources because sources
+	// only notify on changes, and the initial update (on process start) may be lost if no handlers
+	// are registered yet.
+	serviceConfig := config.NewServiceConfig(informerFactory.Core().V1().Services(), s.Config.ConfigSyncPeriod.Duration)
+    // 当监听到Add、Update、Delete事件时，最后都使用proxier.Sync()方法，实际上是往proxy.SyncRunner的run channel中发信号，最后执行的是bfr.tryRun()方法，即调用syncProxyRules方法，syncProxyRules方法详细分析看下面
+	serviceConfig.RegisterEventHandler(s.Proxier)
+    // 最后调用的是syncProxyRules方法
+	go serviceConfig.Run(wait.NeverStop)
+
+    // 同上
+	endpointSliceConfig := config.NewEndpointSliceConfig(informerFactory.Discovery().V1().EndpointSlices(), s.Config.ConfigSyncPeriod.Duration)
+	endpointSliceConfig.RegisterEventHandler(s.Proxier)
+	go endpointSliceConfig.Run(wait.NeverStop)
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.MultiCIDRServiceAllocator) {
+		serviceCIDRConfig := config.NewServiceCIDRConfig(informerFactory.Networking().V1alpha1().ServiceCIDRs(), s.Config.ConfigSyncPeriod.Duration)
+		serviceCIDRConfig.RegisterEventHandler(s.Proxier)
+		go serviceCIDRConfig.Run(wait.NeverStop)
+	}
+	// This has to start after the calls to NewServiceConfig because that
+	// function must configure its shared informer event handlers first.
+	informerFactory.Start(wait.NeverStop)
+
+    // 针对node的informer
+	// Make an informer that selects for our nodename.
+	currentNodeInformerFactory := informers.NewSharedInformerFactoryWithOptions(s.Client, s.Config.ConfigSyncPeriod.Duration,
+		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.FieldSelector = fields.OneTermEqualSelector("metadata.name", s.NodeRef.Name).String()
+		}))
+	nodeConfig := config.NewNodeConfig(currentNodeInformerFactory.Core().V1().Nodes(), s.Config.ConfigSyncPeriod.Duration)
+	// https://issues.k8s.io/111321
+	if s.Config.DetectLocalMode == kubeproxyconfig.LocalModeNodeCIDR {
+		nodeConfig.RegisterEventHandler(proxy.NewNodePodCIDRHandler(s.podCIDRs))
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.KubeProxyDrainingTerminatingNodes) {
+		nodeConfig.RegisterEventHandler(&proxy.NodeEligibleHandler{
+			HealthServer: s.HealthzServer,
+		})
+	}
+	nodeConfig.RegisterEventHandler(s.Proxier)
+
+	go nodeConfig.Run(wait.NeverStop)
+
+	// This has to start after the calls to NewNodeConfig because that must
+	// configure the shared informer event handler first.
+	currentNodeInformerFactory.Start(wait.NeverStop)
+
+    // 记录日志
+	// Birth Cry after the birth is successful
+	s.birthCry()
+
+    // 看下面SyncLoop
+	go s.Proxier.SyncLoop()
+
+	select {
+	case err = <-healthzErrCh:
+		s.Recorder.Eventf(s.NodeRef, nil, api.EventTypeWarning, "FailedToStartProxierHealthcheck", "StartKubeProxy", err.Error())
+	case err = <-metricsErrCh:
+		s.Recorder.Eventf(s.NodeRef, nil, api.EventTypeWarning, "FailedToStartMetricServer", "StartKubeProxy", err.Error())
+	}
+	return err
+}
+```
+#### SyncLoop
+```go
+func (proxier *Proxier) SyncLoop() {
+	// Update healthz timestamp at beginning in case Sync() never succeeds.
+	if proxier.healthzServer != nil {
+		proxier.healthzServer.Updated(proxier.ipFamily)
+	}
+
+	// synthesize "last change queued" time as the informers are syncing.
+	metrics.SyncProxyRulesLastQueuedTimestamp.SetToCurrentTime()
+	proxier.syncRunner.Loop(wait.NeverStop)
+}
+
+func (bfr *BoundedFrequencyRunner) Loop(stop <-chan struct{}) {
+	klog.V(3).Infof("%s Loop running", bfr.name)
+	bfr.timer.Reset(bfr.maxInterval)
+	for {
+		select {
+		case <-stop:
+			bfr.stop()
+			klog.V(3).Infof("%s Loop stopping", bfr.name)
+			return
+		case <-bfr.timer.C():
+			bfr.tryRun()
+		case <-bfr.run:
+			bfr.tryRun()
+		case <-bfr.retry:
+			bfr.doRetry()
+		}
+	}
+}
+```
+#### syncProxyRules
+```go
+// 调用iptables-save/iptables-restore的地方，除了iptablesInit()的规则外其他规则都在这个方法中创建
+// This is where all of the iptables-save/restore calls happen.
+// The only other iptables rules are those that are setup in iptablesInit()
+// This assumes proxier.mu is NOT held
+func (proxier *Proxier) syncProxyRules() {
+	proxier.mu.Lock()
+	defer proxier.mu.Unlock()
+
+    // 在接收到service和endpoints前不要同步规则。这个初始化次数在endpoint和service的informer初始化的时候传进去的
+	// don't sync rules till we've received services and endpoints
+	if !proxier.isInitialized() {
+		klog.V(2).InfoS("Not syncing iptables until Services and Endpoints have been received from master")
+		return
+	}
+
+    // needFullSync这个在nodeInformer监听到有节点上线、下线或变更时会置为true，或者在forceSyncProxyRules方法中也为true，代表全量同步
+	// The value of proxier.needFullSync may change before the defer funcs run, so
+	// we need to keep track of whether it was set at the *start* of the sync.
+	tryPartialSync := !proxier.needFullSync
+
+    // 计时，用于指标暴露
+	// Keep track of how long syncs take.
+	start := time.Now()
+	defer func() {
+		metrics.SyncProxyRulesLatency.Observe(metrics.SinceInSeconds(start))
+		if tryPartialSync {
+			metrics.SyncPartialProxyRulesLatency.Observe(metrics.SinceInSeconds(start))
+		} else {
+			metrics.SyncFullProxyRulesLatency.Observe(metrics.SinceInSeconds(start))
+		}
+		klog.V(2).InfoS("SyncProxyRules complete", "elapsed", time.Since(start))
+	}()
+
+    // 这里传入的serviceChanges和endpointChanges包含了从最近一次iptables同步以来的所有变更，对于单个对象来说，变更是累积的。
+    // 这两个结构体中包含了可以描述service和endpoint实例的所有信息，比如serviceName、servicePortName、Protocol、各种相关链的名称，例如KUBE-SVC,KUBE-SVL,KUBE-SEP,KUBE-FW,KUBE-EXT
+    // svcPortMap和endpointMap初始化的时候是new了两个空的map
+    // Update方法负责将累积的变更与现在的状态进行合并（本质上就是查询新的对象是否已经存在，记录日志，然后不管是否存在都直接替换），生成一个带有要变更对象的新的结构体UpdateServiceMapResult
+    // 这个结构体内有两个集合，分别是UpdatedServices和DeletedUDPClusterIPs
+    // UpdatedServices代表了上次更新后所有的增删改
+    // DeletedUDPClusterIPs保存了旧的（不再分配给service的）并且含有UDP端口的service。可以调用这个来阻止timeout释放或者情况连接追踪信息
+	serviceUpdateResult := proxier.svcPortMap.Update(proxier.serviceChanges)
+	endpointUpdateResult := proxier.endpointsMap.Update(proxier.endpointsChanges)
+
+	klog.V(2).InfoS("Syncing iptables rules")
+
+	success := false
+	defer func() {
+        // 如果此次同步失败，则下次同步时进行全量同步
+		if !success {
+			klog.InfoS("Sync failed", "retryingTime", proxier.syncPeriod)
+			proxier.syncRunner.RetryAfter(proxier.syncPeriod)
+			if tryPartialSync {
+				metrics.IptablesPartialRestoreFailuresTotal.Inc()
+			}
+			// proxier.serviceChanges and proxier.endpointChanges have already
+			// been flushed, so we've lost the state needed to be able to do
+			// a partial sync.
+			proxier.needFullSync = true
+		}
+	}()
+
+    // 不需要全量同步的时候
+	if !tryPartialSync {
+        // 确保跳链规则存在，当kube-proxy第一次启动时或者监控到iptables规则被刷掉时，都进行全量同步，因为全量同步比较耗费时间，所以尽量以增量同步的方式来进行同步
+		// Ensure that our jump rules (eg from PREROUTING to KUBE-SERVICES) exist.
+		// We can't do this as part of the iptables-restore because we don't want
+		// to specify/replace *all* of the rules in PREROUTING, etc.
+		//
+		// We need to create these rules when kube-proxy first starts, and we need
+		// to recreate them if the utiliptables Monitor detects that iptables has
+		// been flushed. In both of those cases, the code will force a full sync.
+		// In all other cases, it ought to be safe to assume that the rules
+		// already exist, so we'll skip this step when doing a partial sync, to
+		// save us from having to invoke /sbin/iptables 20 times on each sync
+		// (which will be very slow on hosts with lots of iptables rules).
+		for _, jump := range append(iptablesJumpChains, iptablesKubeletJumpChains...) {
+            // 确保nat、filter表中指定链存在
+			if _, err := proxier.iptables.EnsureChain(jump.table, jump.dstChain); err != nil {
+				klog.ErrorS(err, "Failed to ensure chain exists", "table", jump.table, "chain", jump.dstChain)
+				return
+			}
+			args := jump.extraArgs
+			if jump.comment != "" {
+				args = append(args, "-m", "comment", "--comment", jump.comment)
+			}
+			args = append(args, "-j", string(jump.dstChain))
+            // 确保表中指定规则存在
+			if _, err := proxier.iptables.EnsureRule(utiliptables.Prepend, jump.table, jump.srcChain, args...); err != nil {
+				klog.ErrorS(err, "Failed to ensure chain jumps", "table", jump.table, "srcChain", jump.srcChain, "dstChain", jump.dstChain)
+				return
+			}
+		}
+	}
+
+	//
+	// Below this point we will not return until we try to write the iptables rules.
+	//
+
+    // 清空filter表和nat表的规则，防止内存重分配并以此提升性能
+	// Reset all buffers used later.
+	// This is to avoid memory reallocations and thus improve performance.
+	proxier.filterChains.Reset()
+	proxier.filterRules.Reset()
+	proxier.natChains.Reset()
+	proxier.natRules.Reset()
+
+	skippedNatChains := proxyutil.NewDiscardLineBuffer()
+	skippedNatRules := proxyutil.NewDiscardLineBuffer()
+
+    // 在filter表中添加KUBE-SERVICES，KUBE-EXTERNAL-SERVICES，KUBE-FORWARD,KUBE-NODEPORTS,KUBE-PROXY-FIREWALL - [0:0]链
+	// Write chain lines for all the "top-level" chains we'll be filling in
+	for _, chainName := range []utiliptables.Chain{kubeServicesChain, kubeExternalServicesChain, kubeForwardChain, kubeNodePortsChain, kubeProxyFirewallChain} {
+		proxier.filterChains.Write(utiliptables.MakeChainLine(chainName))
+	}
+    // 在nat表中添加KUBE-SERVICES，KUBE-NODEPORTS，KUBE-POSTROUTING，KUBE-MARK-MASQ - [0:0]链
+	for _, chainName := range []utiliptables.Chain{kubeServicesChain, kubeNodePortsChain, kubePostroutingChain, kubeMarkMasqChain} {
+		proxier.natChains.Write(utiliptables.MakeChainLine(chainName))
+	}
+
+	// Install the kubernetes-specific postrouting rules. We use a whole chain for
+	// this so that it is easier to flush and change, for example if the mark
+	// value should ever change.
+
+	proxier.natRules.Write(
+		"-A", string(kubePostroutingChain),
+		"-m", "mark", "!", "--mark", fmt.Sprintf("%s/%s", proxier.masqueradeMark, proxier.masqueradeMark),
+		"-j", "RETURN",
+	)
+	// Clear the mark to avoid re-masquerading if the packet re-traverses the network stack.
+	proxier.natRules.Write(
+		"-A", string(kubePostroutingChain),
+		"-j", "MARK", "--xor-mark", proxier.masqueradeMark,
+	)
+	masqRule := []string{
+		"-A", string(kubePostroutingChain),
+		"-m", "comment", "--comment", `"kubernetes service traffic requiring SNAT"`,
+		"-j", "MASQUERADE",
+	}
+	if proxier.iptables.HasRandomFully() {
+		masqRule = append(masqRule, "--random-fully")
+	}
+	proxier.natRules.Write(masqRule)
+    // 创建各种规则
+	....
+
+    // 将规则数据写入buffer
+    // Sync rules.
+	proxier.iptablesData.Reset()
+	proxier.iptablesData.WriteString("*filter\n")
+	proxier.iptablesData.Write(proxier.filterChains.Bytes())
+	proxier.iptablesData.Write(proxier.filterRules.Bytes())
+	proxier.iptablesData.WriteString("COMMIT\n")
+	proxier.iptablesData.WriteString("*nat\n")
+	proxier.iptablesData.Write(proxier.natChains.Bytes())
+	proxier.iptablesData.Write(proxier.natRules.Bytes())
+	proxier.iptablesData.WriteString("COMMIT\n")
+    ....
+
+    // 通过restore方法将所有的数据刷到iptables中去
+    // NOTE: NoFlushTables is used so we don't flush non-kubernetes chains in the table
+	err := proxier.iptables.RestoreAll(proxier.iptablesData.Bytes(), utiliptables.NoFlushTables, utiliptables.RestoreCounters)
+	if err != nil {
+		if pErr, ok := err.(utiliptables.ParseError); ok {
+			lines := utiliptables.ExtractLines(proxier.iptablesData.Bytes(), pErr.Line(), 3)
+			klog.ErrorS(pErr, "Failed to execute iptables-restore", "rules", lines)
+		} else {
+			klog.ErrorS(err, "Failed to execute iptables-restore")
+		}
+		metrics.IptablesRestoreFailuresTotal.Inc()
+		return
+	}
+	success = true
+	proxier.needFullSync = false
+    ...
+}
+```
+
+### 总结
+根据配置文件指定的网络模式生成不同的ProxyServer，注册serviceInfomer和endpointInfomer，监听资源变化，当资源变化时向proxy的run channel中发送信号，合并资源变更并生成相应的规则，刷新主机上的iptables规则。同时也注册了nodeInformer，当节点有增删改时会进行全量的iptables规则同步。
+![kube-proxy](statics/image.png)
