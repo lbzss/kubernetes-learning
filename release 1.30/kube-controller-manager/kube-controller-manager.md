@@ -57,17 +57,18 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 	saTokenControllerDescriptor := newServiceAccountTokenControllerDescriptor(rootClientBuilder)
 
 	run := func(ctx context.Context, controllerDescriptors map[string]*ControllerDescriptor) {
+        // 看下面CreateControllerContext，确保了在启动控制器管理器时，所有必要的组件和客户端都已正确初始化，并且API服务器是健康的
 		controllerContext, err := CreateControllerContext(ctx, c, rootClientBuilder, clientBuilder)
 		if err != nil {
 			logger.Error(err, "Error building controller context")
 			klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 		}
-
+        // 看下面StartControllers
 		if err := StartControllers(ctx, controllerContext, controllerDescriptors, unsecuredMux, healthzHandler); err != nil {
 			logger.Error(err, "Error starting controllers")
 			klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 		}
-
+        // 启动各controllerContext 中的informer
 		controllerContext.InformerFactory.Start(stopCh)
 		controllerContext.ObjectOrMetadataInformerFactory.Start(stopCh)
 		close(controllerContext.InformersStarted)
@@ -75,14 +76,18 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 		<-ctx.Done()
 	}
 
+    // 如果选举机制未启用，直接运行
 	// No leader election, run directly
 	if !c.ComponentConfig.Generic.LeaderElection.LeaderElect {
+        // 没啥特殊的，就是一个map，将各类内置的controller注册进来，然后run的时候遍历启动，如果想看各类controller的具体实现，可以去这里看看
 		controllerDescriptors := NewControllerDescriptors()
 		controllerDescriptors[names.ServiceAccountTokenController] = saTokenControllerDescriptor
+        // 调用上面定义的run方法，实际上就是为每一个controller启动一个专有上下文，再调用各controller的initFunc
 		run(ctx, controllerDescriptors)
 		return nil
 	}
 
+    // 下面是处理leader选举和leader迁移的功能
 	id, err := os.Hostname()
 	if err != nil {
 		return err
@@ -91,6 +96,7 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 	// add a uniquifier so that two processes on the same host don't accidentally both become active
 	id = id + "_" + string(uuid.NewUUID())
 
+    // 初始化leaderMigrator。只有leader迁移启用时才为非空
 	// leaderMigrator will be non-nil if and only if Leader Migration is enabled.
 	var leaderMigrator *leadermigration.LeaderMigrator = nil
 
@@ -104,6 +110,7 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 		// startSATokenControllerInit is the original InitFunc.
 		startSATokenControllerInit := saTokenControllerDescriptor.GetInitFunc()
 
+        // 包装saTokenControllerDescriptor的初始化函数，以便在启动控制器后标记迁移准备就绪。
 		// Wrap saTokenControllerDescriptor to signal readiness for migration after starting
 		//  the controller.
 		saTokenControllerDescriptor.initFunc = func(ctx context.Context, controllerContext ControllerContext, controllerName string) (controller.Interface, bool, error) {
@@ -112,11 +119,13 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 		}
 	}
 
+    // 启动领导选举
 	// Start the main lock
 	go leaderElectAndRun(ctx, c, id, electionChecker,
 		c.ComponentConfig.Generic.LeaderElection.ResourceLock,
 		c.ComponentConfig.Generic.LeaderElection.ResourceName,
 		leaderelection.LeaderCallbacks{
+            // 如果是leader，则跟上面的启动流程一样，注册各类内置的controller，不过需要筛选出不可迁移的controller
 			OnStartedLeading: func(ctx context.Context) {
 				controllerDescriptors := NewControllerDescriptors()
 				if leaderMigrator != nil {
@@ -128,6 +137,7 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 				controllerDescriptors[names.ServiceAccountTokenController] = saTokenControllerDescriptor
 				run(ctx, controllerDescriptors)
 			},
+            // 失去leader身份时的处理流程
 			OnStoppedLeading: func() {
 				logger.Error(nil, "leaderelection lost")
 				klog.FlushAndExit(klog.ExitFlushTimeout, 1)
@@ -136,17 +146,20 @@ func Run(ctx context.Context, c *config.CompletedConfig) error {
 
 	// If Leader Migration is enabled, proceed to attempt the migration lock.
 	if leaderMigrator != nil {
+        // 等待ServiceAccountTokenController运行完，这就是为什么要包装一层的原因
 		// Wait for Service Account Token Controller to start before acquiring the migration lock.
 		// At this point, the main lock must have already been acquired, or the KCM process already exited.
 		// We wait for the main lock before acquiring the migration lock to prevent the situation
 		//  where KCM instance A holds the main lock while KCM instance B holds the migration lock.
 		<-leaderMigrator.MigrationReady
 
+        // 启动迁移
 		// Start the migration lock.
 		go leaderElectAndRun(ctx, c, id, electionChecker,
 			c.ComponentConfig.Generic.LeaderMigration.ResourceLock,
 			c.ComponentConfig.Generic.LeaderMigration.LeaderName,
 			leaderelection.LeaderCallbacks{
+                // 启动所有迁移的controller，除了ServiceAccountTokenController
 				OnStartedLeading: func(ctx context.Context) {
 					logger.Info("leader migration: starting migrated controllers.")
 					controllerDescriptors := NewControllerDescriptors()
@@ -299,4 +312,270 @@ func (e *TokensController) syncServiceAccount(ctx context.Context) {
 		}
 	}
 }
+
+func (e *TokensController) syncSecret(ctx context.Context) {
+    // 从secret同步队列中获取一个对象
+	key, quit := e.syncSecretQueue.Get()
+	if quit {
+		return
+	}
+	defer e.syncSecretQueue.Done(key)
+
+	logger := klog.FromContext(ctx)
+	// Track whether or not we should retry this sync
+	retry := false
+	defer func() {
+		e.retryOrForget(logger, e.syncSecretQueue, key, retry)
+	}()
+    // 解析，确认是否为secret
+	secretInfo, err := parseSecretQueueKey(key)
+	if err != nil {
+		logger.Error(err, "Parsing secret queue key")
+		return
+	}
+    // 从本地缓存中查找对应的secret是否存在
+	secret, err := e.getSecret(secretInfo.namespace, secretInfo.name, secretInfo.uid, false)
+	switch {
+	case err != nil:
+		logger.Error(err, "Getting secret")
+		retry = true
+	case secret == nil:
+        // 如果secret不存在，查询本地缓存中是否存在secret相对应的serviceAccount，如果serviceAccount存在，则从apiserver中删除serviceAccount
+		// If the service account exists
+		if sa, saErr := e.getServiceAccount(secretInfo.namespace, secretInfo.saName, secretInfo.saUID, false); saErr == nil && sa != nil {
+			// secret no longer exists, so delete references to this secret from the service account
+			if err := clientretry.RetryOnConflict(RemoveTokenBackoff, func() error {
+				return e.removeSecretReference(secretInfo.namespace, secretInfo.saName, secretInfo.saUID, secretInfo.name)
+			}); err != nil {
+				logger.Error(err, "Removing secret reference")
+			}
+		}
+	default:
+        // secret存在，确定serviceAccount是否存在，如果本地缓存中没有就连apiserver取找
+		// Ensure service account exists
+		sa, saErr := e.getServiceAccount(secretInfo.namespace, secretInfo.saName, secretInfo.saUID, true)
+		switch {
+		case saErr != nil:
+			logger.Error(saErr, "Getting service account")
+			retry = true
+		case sa == nil:
+            // 如果sa不存在，则通过apiserver删除相关联的token
+			// Delete token
+			logger.V(4).Info("Service account does not exist, deleting token", "secret", klog.KRef(secretInfo.namespace, secretInfo.name))
+			if retriable, err := e.deleteToken(secretInfo.namespace, secretInfo.name, secretInfo.uid); err != nil {
+				logger.Error(err, "Deleting serviceaccount token", "secret", klog.KRef(secretInfo.namespace, secretInfo.name), "serviceAccount", klog.KRef(secretInfo.namespace, secretInfo.saName))
+				retry = retriable
+			}
+		default:
+            // 如果sa存在，则在apiserver中更新token
+			// Update token if needed
+			if retriable, err := e.generateTokenIfNeeded(logger, sa, secret); err != nil {
+				logger.Error(err, "Populating serviceaccount token", "secret", klog.KRef(secretInfo.namespace, secretInfo.name), "serviceAccount", klog.KRef(secretInfo.namespace, secretInfo.saName))
+				retry = retriable
+			}
+		}
+	}
+}
 ```
+### CreateControllerContext
+```go
+// 创建包含各种controller所引用资源的上下文结构体实例，例如cloud provider和clientBuilder。rootClientBuilder仅用于shared-informers和token controller
+// CreateControllerContext creates a context struct containing references to resources needed by the
+// controllers such as the cloud provider and clientBuilder. rootClientBuilder is only used for
+// the shared-informers client and token controller.
+func CreateControllerContext(ctx context.Context, s *config.CompletedConfig, rootClientBuilder, clientBuilder clientbuilder.ControllerClientBuilder) (ControllerContext, error) {
+	// Informer transform to trim ManagedFields for memory efficiency.
+	trim := func(obj interface{}) (interface{}, error) {
+        // 获取对象的metadata内容，清空Managed字段，以节省内存
+		if accessor, err := meta.Accessor(obj); err == nil {
+			if accessor.GetManagedFields() != nil {
+				accessor.SetManagedFields(nil)
+			}
+		}
+		return obj, nil
+	}
+    // 创建informer
+	versionedClient := rootClientBuilder.ClientOrDie("shared-informers")
+	sharedInformers := informers.NewSharedInformerFactoryWithOptions(versionedClient, ResyncPeriod(s)(), informers.WithTransform(trim))
+
+	metadataClient := metadata.NewForConfigOrDie(rootClientBuilder.ConfigOrDie("metadata-informers"))
+	metadataInformers := metadatainformer.NewSharedInformerFactoryWithOptions(metadataClient, ResyncPeriod(s)(), metadatainformer.WithTransform(trim))
+
+    // 等待apiserver正常运行，在10秒内每隔1秒都去检测一次，如果超过10s状态还没有变为可用，则返回错误
+	// If apiserver is not running we should wait for some time and fail only then. This is particularly
+	// important when we start apiserver and controller manager at the same time.
+	if err := genericcontrollermanager.WaitForAPIServer(versionedClient, 10*time.Second); err != nil {
+		return ControllerContext{}, fmt.Errorf("failed to wait for apiserver being healthy: %v", err)
+	}
+
+	// Use a discovery client capable of being refreshed.
+	discoveryClient := rootClientBuilder.DiscoveryClientOrDie("controller-discovery")
+	cachedClient := cacheddiscovery.NewMemCacheClient(discoveryClient)
+	restMapper := restmapper.NewDeferredDiscoveryRESTMapper(cachedClient)
+    // 定期重置
+	go wait.Until(func() {
+		restMapper.Reset()
+	}, 30*time.Second, ctx.Done())
+
+	cloud, loopMode, err := createCloudProvider(klog.FromContext(ctx), s.ComponentConfig.KubeCloudShared.CloudProvider.Name, s.ComponentConfig.KubeCloudShared.ExternalCloudVolumePlugin,
+		s.ComponentConfig.KubeCloudShared.CloudProvider.CloudConfigFile, s.ComponentConfig.KubeCloudShared.AllowUntaggedCloud, sharedInformers)
+	if err != nil {
+		return ControllerContext{}, err
+	}
+
+	controllerContext := ControllerContext{
+		ClientBuilder:                   clientBuilder,
+		InformerFactory:                 sharedInformers,
+		ObjectOrMetadataInformerFactory: informerfactory.NewInformerFactory(sharedInformers, metadataInformers),
+		ComponentConfig:                 s.ComponentConfig,
+		RESTMapper:                      restMapper,
+		Cloud:                           cloud,
+		LoopMode:                        loopMode,
+		InformersStarted:                make(chan struct{}),
+		ResyncPeriod:                    ResyncPeriod(s),
+		ControllerManagerMetrics:        controllersmetrics.NewControllerManagerMetrics("kube-controller-manager"),
+	}
+
+	if controllerContext.ComponentConfig.GarbageCollectorController.EnableGarbageCollector &&
+		controllerContext.IsControllerEnabled(NewControllerDescriptors()[names.GarbageCollectorController]) {
+		ignoredResources := make(map[schema.GroupResource]struct{})
+		for _, r := range controllerContext.ComponentConfig.GarbageCollectorController.GCIgnoredResources {
+			ignoredResources[schema.GroupResource{Group: r.Group, Resource: r.Resource}] = struct{}{}
+		}
+
+		controllerContext.GraphBuilder = garbagecollector.NewDependencyGraphBuilder(
+			ctx,
+			metadataClient,
+			controllerContext.RESTMapper,
+			ignoredResources,
+			controllerContext.ObjectOrMetadataInformerFactory,
+			controllerContext.InformersStarted,
+		)
+	}
+
+	controllersmetrics.Register()
+	return controllerContext, nil
+}
+```
+### StartControllers
+使用上面创建好的controllerContext来启动controller
+```go
+func StartControllers(ctx context.Context, controllerCtx ControllerContext, controllerDescriptors map[string]*ControllerDescriptor,
+	unsecuredMux *mux.PathRecorderMux, healthzHandler *controllerhealthz.MutableHealthzHandler) error {
+	var controllerChecks []healthz.HealthChecker
+
+    // 先启动serviceaccount-token-controller，因为其他组件依赖它来生成token。如果启动失败了，就从这里直接返回。因为其他的controller没法获得凭证
+	// Always start the SA token controller first using a full-power client, since it needs to mint tokens for the rest
+	// If this fails, just return here and fail since other controllers won't be able to get credentials.
+	if serviceAccountTokenControllerDescriptor, ok := controllerDescriptors[names.ServiceAccountTokenController]; ok {
+        // 启动指定的controller，看下面
+		check, err := StartController(ctx, controllerCtx, serviceAccountTokenControllerDescriptor, unsecuredMux)
+		if err != nil {
+			return err
+		}
+		if check != nil {
+			// HealthChecker should be present when controller has started
+			controllerChecks = append(controllerChecks, check)
+		}
+	}
+
+	// Initialize the cloud provider with a reference to the clientBuilder only after token controller
+	// has started in case the cloud provider uses the client builder.
+	if controllerCtx.Cloud != nil {
+		controllerCtx.Cloud.Initialize(controllerCtx.ClientBuilder, ctx.Done())
+	}
+
+	// Each controller is passed a context where the logger has the name of
+	// the controller set through WithName. That name then becomes the prefix of
+	// of all log messages emitted by that controller.
+	//
+	// In StartController, an explicit "controller" key is used instead, for two reasons:
+	// - while contextual logging is alpha, klog.LoggerWithName is still a no-op,
+	//   so we cannot rely on it yet to add the name
+	// - it allows distinguishing between log entries emitted by the controller
+	//   and those emitted for it - this is a bit debatable and could be revised.
+	for _, controllerDesc := range controllerDescriptors {
+        // 确保service-account-token controller先启动，在上面启动后不再进行二次启动
+		if controllerDesc.RequiresSpecialHandling() {
+			continue
+		}
+        // 启动指定的controller，看下面
+		check, err := StartController(ctx, controllerCtx, controllerDesc, unsecuredMux)
+		if err != nil {
+			return err
+		}
+		if check != nil {
+			// HealthChecker should be present when controller has started
+			controllerChecks = append(controllerChecks, check)
+		}
+	}
+    // 加载handler的健康检测路由
+	healthzHandler.AddHealthChecker(controllerChecks...)
+
+	return nil
+}
+
+func StartController(ctx context.Context, controllerCtx ControllerContext, controllerDescriptor *ControllerDescriptor,
+	unsecuredMux *mux.PathRecorderMux) (healthz.HealthChecker, error) {
+	logger := klog.FromContext(ctx)
+	controllerName := controllerDescriptor.Name()
+    // 验证controller是否被特性门控禁用
+	for _, featureGate := range controllerDescriptor.GetRequiredFeatureGates() {
+		if !utilfeature.DefaultFeatureGate.Enabled(featureGate) {
+			logger.Info("Controller is disabled by a feature gate", "controller", controllerName, "requiredFeatureGates", controllerDescriptor.GetRequiredFeatureGates())
+			return nil, nil
+		}
+	}
+
+	if controllerDescriptor.IsCloudProviderController() && controllerCtx.LoopMode != IncludeCloudLoops {
+		logger.Info("Skipping a cloud provider controller", "controller", controllerName, "loopMode", controllerCtx.LoopMode)
+		return nil, nil
+	}
+    // 验证controller是否被启用
+	if !controllerCtx.IsControllerEnabled(controllerDescriptor) {
+		logger.Info("Warning: controller is disabled", "controller", controllerName)
+		return nil, nil
+	}
+
+	time.Sleep(wait.Jitter(controllerCtx.ComponentConfig.Generic.ControllerStartInterval.Duration, ControllerStartJitter))
+
+	logger.V(1).Info("Starting controller", "controller", controllerName)
+    // 获取各controller的初始化方法
+	initFunc := controllerDescriptor.GetInitFunc()
+    // 启动controller，需要跳转到各个controller的定义去单独看
+	ctrl, started, err := initFunc(klog.NewContext(ctx, klog.LoggerWithName(logger, controllerName)), controllerCtx, controllerName)
+	if err != nil {
+		logger.Error(err, "Error starting controller", "controller", controllerName)
+		return nil, err
+	}
+	if !started {
+		logger.Info("Warning: skipping controller", "controller", controllerName)
+		return nil, nil
+	}
+
+	check := controllerhealthz.NamedPingChecker(controllerName)
+	if ctrl != nil {
+        // 如果controller支持debug，并且存在debugHandler，则注册debug路由
+		// check if the controller supports and requests a debugHandler
+		// and it needs the unsecuredMux to mount the handler onto.
+		if debuggable, ok := ctrl.(controller.Debuggable); ok && unsecuredMux != nil {
+			if debugHandler := debuggable.DebuggingHandler(); debugHandler != nil {
+				basePath := "/debug/controllers/" + controllerName
+				unsecuredMux.UnlistedHandle(basePath, http.StripPrefix(basePath, debugHandler))
+				unsecuredMux.UnlistedHandlePrefix(basePath+"/", http.StripPrefix(basePath, debugHandler))
+			}
+		}
+        // 同上
+		if healthCheckable, ok := ctrl.(controller.HealthCheckable); ok {
+			if realCheck := healthCheckable.HealthChecker(); realCheck != nil {
+				check = controllerhealthz.NamedHealthChecker(controllerName, realCheck)
+			}
+		}
+	}
+
+	logger.Info("Started controller", "controller", controllerName)
+	return check, nil
+}
+```
+以上为controller-manager主逻辑
+## 其他类型Controller实现
