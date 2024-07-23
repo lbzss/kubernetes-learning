@@ -579,3 +579,357 @@ func StartController(ctx context.Context, controllerCtx ControllerContext, contr
 ```
 以上为controller-manager主逻辑
 ## 其他类型Controller实现
+![alt text](image.png)
+在NewControllerDescriptors方法中有图上的内容，实际就是用来注册所有内置的controller
+## 以Deployment为例看看DeploymentController具体实现
+首先找到Deployment的InitFunc来看下逻辑
+```go
+func newDeploymentControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:     names.DeploymentController,
+		aliases:  []string{"deployment"},
+		initFunc: startDeploymentController,
+	}
+}
+
+// cmd/kube-controller-manager/app/apps.go:106
+func startDeploymentController(ctx context.Context, controllerContext ControllerContext, controllerName string) (controller.Interface, bool, error) {
+    // 传入deploymentInformer，replicaSetInformer、PodInformer和kubeClient初始化实例
+	dc, err := deployment.NewDeploymentController(
+		ctx,
+		controllerContext.InformerFactory.Apps().V1().Deployments(),
+		controllerContext.InformerFactory.Apps().V1().ReplicaSets(),
+		controllerContext.InformerFactory.Core().V1().Pods(),
+		controllerContext.ClientBuilder.ClientOrDie("deployment-controller"),
+	)
+	if err != nil {
+		return nil, true, fmt.Errorf("error creating Deployment controller: %v", err)
+	}
+	go dc.Run(ctx, int(controllerContext.ComponentConfig.DeploymentController.ConcurrentDeploymentSyncs))
+	return nil, true, nil
+}
+// pkg/controller/deployment/deployment_controller.go:101
+func NewDeploymentController(ctx context.Context, dInformer appsinformers.DeploymentInformer, rsInformer appsinformers.ReplicaSetInformer, podInformer coreinformers.PodInformer, client clientset.Interface) (*DeploymentController, error) {
+	eventBroadcaster := record.NewBroadcaster(record.WithContext(ctx))
+	logger := klog.FromContext(ctx)
+	dc := &DeploymentController{
+		client:           client,
+		eventBroadcaster: eventBroadcaster,
+		eventRecorder:    eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "deployment-controller"}),
+		queue:            workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "deployment"),
+	}
+	dc.rsControl = controller.RealRSControl{
+		KubeClient: client,
+		Recorder:   dc.eventRecorder,
+	}
+
+    // 设置Deployment的添加、更新和删除事件的处理程序
+	dInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			dc.addDeployment(logger, obj)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			dc.updateDeployment(logger, oldObj, newObj)
+		},
+		// This will enter the sync loop and no-op, because the deployment has been deleted from the store.
+		DeleteFunc: func(obj interface{}) {
+			dc.deleteDeployment(logger, obj)
+		},
+	})
+    // 同上
+	rsInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			dc.addReplicaSet(logger, obj)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			dc.updateReplicaSet(logger, oldObj, newObj)
+		},
+		DeleteFunc: func(obj interface{}) {
+			dc.deleteReplicaSet(logger, obj)
+		},
+	})
+    // 仅设置Pod的删除事件的处理程序
+	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		DeleteFunc: func(obj interface{}) {
+			dc.deletePod(logger, obj)
+		},
+	})
+    // 设置同步处理程序，负责实际的同步逻辑
+	dc.syncHandler = dc.syncDeployment
+    // 设置队列入队函数，用于将Deployment对象放入工作队列。
+	dc.enqueueDeployment = dc.enqueue
+
+    // 分别初始化Deployment、ReplicaSet和Pod的Lister，用于从本地缓存中获取对象。
+	dc.dLister = dInformer.Lister()
+	dc.rsLister = rsInformer.Lister()
+	dc.podLister = podInformer.Lister()
+    // 初始化同步检查函数，确保本地缓存已同步。
+	dc.dListerSynced = dInformer.Informer().HasSynced
+	dc.rsListerSynced = rsInformer.Informer().HasSynced
+	dc.podListerSynced = podInformer.Informer().HasSynced
+	return dc, nil
+}
+
+// pkg/controller/deployment/deployment_controller.go:585
+// syncDeployment will sync the deployment with the given key.
+// This function is not meant to be invoked concurrently with the same key.
+func (dc *DeploymentController) syncDeployment(ctx context.Context, key string) error {
+	logger := klog.FromContext(ctx)
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		logger.Error(err, "Failed to split meta namespace cache key", "cacheKey", key)
+		return err
+	}
+
+    // 记录开始和结束时间
+	startTime := time.Now()
+	logger.V(4).Info("Started syncing deployment", "deployment", klog.KRef(namespace, name), "startTime", startTime)
+	defer func() {
+		logger.V(4).Info("Finished syncing deployment", "deployment", klog.KRef(namespace, name), "duration", time.Since(startTime))
+	}()
+
+    // 从本地informer缓存中根据名称和名称空间获取deployment实例
+	deployment, err := dc.dLister.Deployments(namespace).Get(name)
+    // 如果记录不存在，则记录日志并返回
+	if errors.IsNotFound(err) {
+		logger.V(2).Info("Deployment has been deleted", "deployment", klog.KRef(namespace, name))
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	// Deep-copy otherwise we are mutating our cache.
+	// TODO: Deep-copy only when needed.
+	d := deployment.DeepCopy()
+
+	everything := metav1.LabelSelector{}
+    // deployment使用标签选择器来匹配对应的pod，如果标签选择器没有指定，则代表选择所有的pod，这与deployment的设计不符合，更新deployment的状态并返回
+	if reflect.DeepEqual(d.Spec.Selector, &everything) {
+		dc.eventRecorder.Eventf(d, v1.EventTypeWarning, "SelectingAll", "This deployment is selecting all pods. A non-empty selector is required.")
+		if d.Status.ObservedGeneration < d.Generation {
+			d.Status.ObservedGeneration = d.Generation
+			dc.client.AppsV1().Deployments(d.Namespace).UpdateStatus(ctx, d, metav1.UpdateOptions{})
+		}
+		return nil
+	}
+
+    // 获取deployment相关的replicaSet，看下面getReplicaSetsForDeployment
+	// List ReplicaSets owned by this Deployment, while reconciling ControllerRef
+	// through adoption/orphaning.
+	rsList, err := dc.getReplicaSetsForDeployment(ctx, d)
+	if err != nil {
+		return err
+	}
+    // 获取deployment相关的podMap，看下面getPodMapForDeployment
+	// List all Pods owned by this Deployment, grouped by their ReplicaSet.
+	// Current uses of the podMap are:
+	//
+	// * check if a Pod is labeled correctly with the pod-template-hash label.
+	// * check that no old Pods are running in the middle of Recreate Deployments.
+	podMap, err := dc.getPodMapForDeployment(d, rsList)
+	if err != nil {
+		return err
+	}
+
+    // 如果deployment处于删除中，只更新状态，不进行其他操作
+	if d.DeletionTimestamp != nil {
+		return dc.syncStatusOnly(ctx, d, rsList)
+	}
+
+    // 更新Deploymenet的状态，确保在暂停\恢复Deployment时不会超时
+	// Update deployment conditions with an Unknown condition when pausing/resuming
+	// a deployment. In this way, we can be sure that we won't timeout when a user
+	// resumes a Deployment with a set progressDeadlineSeconds.
+	if err = dc.checkPausedConditions(ctx, d); err != nil {
+		return err
+	}
+
+    // 如果deployment已暂停，只同步状态，不进行其他操作
+	if d.Spec.Paused {
+		return dc.sync(ctx, d, rsList)
+	}
+
+    // 如果需要回滚，则调用rollback函数进行回滚
+    // 回滚的逻辑：判断回滚的版本是不是0，如果是0代表回滚到上个版本，找到上个版本，如果找不到上个版本，则放弃回滚；如果不是0，则找到对应版本（revision）的rs，
+    // 把rs的template拷贝到dp中，然后调用接口更新（如果目标版本rs和现在dp的pod template一样，也不会滚动）。
+	// rollback is not re-entrant in case the underlying replica sets are updated with a new
+	// revision so we should ensure that we won't proceed to update replica sets until we
+	// make sure that the deployment has cleaned up its rollback spec in subsequent enqueues.
+	if getRollbackTo(d) != nil {
+		return dc.rollback(ctx, d, rsList)
+	}
+
+    // 检查是否是扩缩容事件，如果是，则进行同步操作
+    // 判断的依据是当前dp的replicas是不是和活跃（有pod副本的rs）的rs deployment.kubernetes.io/desired-replicas一样，如果不一样，那么需要调用sync回滚
+	scalingEvent, err := dc.isScalingEvent(ctx, d, rsList)
+	if err != nil {
+		return err
+	}
+	if scalingEvent {
+		return dc.sync(ctx, d, rsList)
+	}
+
+	switch d.Spec.Strategy.Type {
+	case apps.RecreateDeploymentStrategyType:
+		return dc.rolloutRecreate(ctx, d, rsList, podMap)
+	case apps.RollingUpdateDeploymentStrategyType:
+        // 首先获取 Deployment 对应的全部 ReplicaSet 资源；
+        // 通过 reconcileNewReplicaSet 调解新 ReplicaSet 的副本数，创建新的 Pod 并保证额外的副本数量不超过 maxSurge；
+        // 通过 reconcileOldReplicaSets 调解历史 ReplicaSet 的副本数，删除旧的 Pod 并保证不可用的部分数不会超过 maxUnavailable；
+        // 最后删除无用的 ReplicaSet 并更新 Deployment 的状态；
+		return dc.rolloutRolling(ctx, d, rsList)
+	}
+	return fmt.Errorf("unexpected deployment strategy type: %s", d.Spec.Strategy.Type)
+}
+
+
+// pkg/controller/deployment/deployment_controller.go:157
+func (dc *DeploymentController) Run(ctx context.Context, workers int) {
+	defer utilruntime.HandleCrash()
+
+	// Start events processing pipeline.
+	dc.eventBroadcaster.StartStructuredLogging(3)
+	dc.eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: dc.client.CoreV1().Events("")})
+	defer dc.eventBroadcaster.Shutdown()
+
+	defer dc.queue.ShutDown()
+
+	logger := klog.FromContext(ctx)
+	logger.Info("Starting controller", "controller", "deployment")
+	defer logger.Info("Shutting down controller", "controller", "deployment")
+
+	if !cache.WaitForNamedCacheSync("deployment", ctx.Done(), dc.dListerSynced, dc.rsListerSynced, dc.podListerSynced) {
+		return
+	}
+
+	for i := 0; i < workers; i++ {
+		go wait.UntilWithContext(ctx, dc.worker, time.Second)
+	}
+
+	<-ctx.Done()
+}
+```
+
+### getReplicaSetsForDeployment
+```go
+// pkg/controller/deployment/deployment_controller.go:520
+// getReplicaSetsForDeployment uses ControllerRefManager to reconcile
+// ControllerRef by adopting and orphaning.
+// It returns the list of ReplicaSets that this Deployment should manage.
+func (dc *DeploymentController) getReplicaSetsForDeployment(ctx context.Context, d *apps.Deployment) ([]*apps.ReplicaSet, error) {
+    // 从informer缓存中获取该名称空间下所有的replicaSet
+	// List all ReplicaSets to find those we own but that no longer match our
+	// selector. They will be orphaned by ClaimReplicaSets().
+	rsList, err := dc.rsLister.ReplicaSets(d.Namespace).List(labels.Everything())
+	if err != nil {
+		return nil, err
+	}
+    // 获取deployment对应的labelSelector
+	deploymentSelector, err := metav1.LabelSelectorAsSelector(d.Spec.Selector)
+	if err != nil {
+		return nil, fmt.Errorf("deployment %s/%s has invalid label selector: %v", d.Namespace, d.Name, err)
+	}
+    // 包装了一层，从apiserver获取deployemnt后判断是否存在deletionTimestamp表明该deployment是否被删除
+	// If any adoptions are attempted, we should first recheck for deletion with
+	// an uncached quorum read sometime after listing ReplicaSets (see #42639).
+	canAdoptFunc := controller.RecheckDeletionTimestamp(func(ctx context.Context) (metav1.Object, error) {
+		fresh, err := dc.client.AppsV1().Deployments(d.Namespace).Get(ctx, d.Name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		if fresh.UID != d.UID {
+			return nil, fmt.Errorf("original Deployment %v/%v is gone: got uid %v, wanted %v", d.Namespace, d.Name, fresh.UID, d.UID)
+		}
+		return fresh, nil
+	})
+	cm := controller.NewReplicaSetControllerRefManager(dc.rsControl, d, deploymentSelector, controllerKind, canAdoptFunc)
+    // 看下面ClaimReplicaSets
+	return cm.ClaimReplicaSets(ctx, rsList)
+}
+
+// 尝试获取replicaSet的属主
+// ClaimReplicaSets tries to take ownership of a list of ReplicaSets.
+// 如果label不满足，则从replicaSet切片中删除，如果满足，则将replicaSet实例添加到切片中
+// It will reconcile the following:
+//   - Adopt orphans if the selector matches.
+//   - Release owned objects if the selector no longer matches.
+//
+// A non-nil error is returned if some form of reconciliation was attempted and
+// failed. Usually, controllers should try again later in case reconciliation
+// is still needed.
+//
+// If the error is nil, either the reconciliation succeeded, or no
+// reconciliation was necessary. The list of ReplicaSets that you now own is
+// returned.
+func (m *ReplicaSetControllerRefManager) ClaimReplicaSets(ctx context.Context, sets []*apps.ReplicaSet) ([]*apps.ReplicaSet, error) {
+	var claimed []*apps.ReplicaSet
+	var errlist []error
+
+	match := func(obj metav1.Object) bool {
+        // 判断label是否符合spec
+		return m.Selector.Matches(labels.Set(obj.GetLabels()))
+	}
+	adopt := func(ctx context.Context, obj metav1.Object) error {
+        // 绑定
+		return m.AdoptReplicaSet(ctx, obj.(*apps.ReplicaSet))
+	}
+	release := func(ctx context.Context, obj metav1.Object) error {
+        // 解绑
+		return m.ReleaseReplicaSet(ctx, obj.(*apps.ReplicaSet))
+	}
+
+	for _, rs := range sets {
+		ok, err := m.ClaimObject(ctx, rs, match, adopt, release)
+		if err != nil {
+			errlist = append(errlist, err)
+			continue
+		}
+		if ok {
+			claimed = append(claimed, rs)
+		}
+	}
+	return claimed, utilerrors.NewAggregate(errlist)
+}
+```
+### getPodMapForDeployment
+```go
+// getPodMapForDeployment returns the Pods managed by a Deployment.
+//
+// It returns a map from ReplicaSet UID to a list of Pods controlled by that RS,
+// according to the Pod's ControllerRef.
+// NOTE: The pod pointers returned by this method point the pod objects in the cache and thus
+// shouldn't be modified in any way.
+func (dc *DeploymentController) getPodMapForDeployment(d *apps.Deployment, rsList []*apps.ReplicaSet) (map[types.UID][]*v1.Pod, error) {
+    // 获取labelSelector
+	// Get all Pods that potentially belong to this Deployment.
+	selector, err := metav1.LabelSelectorAsSelector(d.Spec.Selector)
+	if err != nil {
+		return nil, err
+	}
+    // 获取所有符合条件的pod
+	pods, err := dc.podLister.Pods(d.Namespace).List(selector)
+	if err != nil {
+		return nil, err
+	}
+    // 根据replicaSet ID归类各pod
+	// Group Pods by their controller (if it's in rsList).
+	podMap := make(map[types.UID][]*v1.Pod, len(rsList))
+	for _, rs := range rsList {
+		podMap[rs.UID] = []*v1.Pod{}
+	}
+	for _, pod := range pods {
+		// Do not ignore inactive Pods because Recreate Deployments need to verify that no
+		// Pods from older versions are running before spinning up new Pods.
+		controllerRef := metav1.GetControllerOf(pod)
+		if controllerRef == nil {
+			continue
+		}
+		// Only append if we care about this UID.
+		if _, ok := podMap[controllerRef.UID]; ok {
+			podMap[controllerRef.UID] = append(podMap[controllerRef.UID], pod)
+		}
+	}
+	return podMap, nil
+}
+```
