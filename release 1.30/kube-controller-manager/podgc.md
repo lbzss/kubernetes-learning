@@ -146,7 +146,14 @@ func (gcc *PodGCController) gcTerminated(ctx context.Context, pods []*v1.Pod) {
 }
 ```
 ##### markFailedAndDeletePod
-功能很简单，就是强制删除处于 terminated 状态的 pod。不过这里有特性门控 PodDisruptionConditions 和 JobPodReplacementPolicy。这里后面再详细看，先看主流程
+功能很简单，就是强制删除处于 terminated 状态的 pod。不过这里有特性门控 PodDisruptionConditions 和 JobPodReplacementPolicy。
+PodDisruptionConditions：允许 Pod 的中断状态被标记为条件（如由于节点中断）。
+JobPodReplacementPolicy：支持 Job 控制器在 Pod 终止后，创建新的替代 Pod。
+
+主要是为了避免某些边缘情况中的问题，比如：
+
+孤立的 Pod：如果 Pod 被孤立（节点消失），它可能会无限期停留在 Running 状态，因此在删除前将其标记为 Failed。
+Job 替代策略支持：如果 Pod 属于 Job 控制器，需要先将其状态转为 Failed，以便 Job 控制器能创建新的替代 Pod。
 ```go
 func (gcc *PodGCController) markFailedAndDeletePod(ctx context.Context, pod *v1.Pod) error {
 	return gcc.markFailedAndDeletePodWithCondition(ctx, pod, nil)
@@ -160,7 +167,8 @@ func (gcc *PodGCController) markFailedAndDeletePodWithCondition(ctx context.Cont
 	// See https://github.com/kubernetes/enhancements/tree/master/keps/sig-apps/3939-allow-replacement-when-fully-terminated#risks-and-mitigations
 	// for more details.
 	if utilfeature.DefaultFeatureGate.Enabled(features.PodDisruptionConditions) || utilfeature.DefaultFeatureGate.Enabled(features.JobPodReplacementPolicy) {
-
+        // 如果 Pod 当前状态不是 Succeeded 或 Failed（即 Pod 还在运行或待调度状态），则创建一个新的状态副本（newStatus），将 Pod 的状态标记为 Failed。
+        // 如果有提供 condition，并且 PodDisruptionConditions 特性已启用，则更新 Pod 的状态条件，确保记录原因和消息。
 		// Mark the pod as failed - this is especially important in case the pod
 		// is orphaned, in which case the pod would remain in the Running phase
 		// forever as there is no kubelet running to change the phase.
@@ -170,6 +178,7 @@ func (gcc *PodGCController) markFailedAndDeletePodWithCondition(ctx context.Cont
 			if condition != nil && utilfeature.DefaultFeatureGate.Enabled(features.PodDisruptionConditions) {
 				apipod.UpdatePodCondition(newStatus, condition)
 			}
+            // 使用 Patch 操作更新 Pod 的状态，这样做可以避免冲突或覆盖其他字段：
 			if _, _, _, err := utilpod.PatchPodStatus(ctx, gcc.kubeClient, pod.Namespace, pod.Name, pod.UID, pod.Status, *newStatus); err != nil {
 				return err
 			}
