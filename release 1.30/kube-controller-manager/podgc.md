@@ -152,7 +152,7 @@ JobPodReplacementPolicy：支持 Job 控制器在 Pod 终止后，创建新的�
 
 主要是为了避免某些边缘情况中的问题，比如：
 
-孤立的 Pod：如果 Pod 被孤立（节点消失），它可能会无限期停留在 Running 状态，因此在删除前将其标记为 Failed。
+孤孤儿 Pod：如果 Pod 被孤立（节点消失），它可能会无限期停留在 Running 状态，因此在删除前将其标记为 Failed。
 Job 替代策略支持：如果 Pod 属于 Job 控制器，需要先将其状态转为 Failed，以便 Job 控制器能创建新的替代 Pod。
 ```go
 func (gcc *PodGCController) markFailedAndDeletePod(ctx context.Context, pod *v1.Pod) error {
